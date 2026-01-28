@@ -2,7 +2,7 @@
 
 Interactive wizard for migrating secrets between Secret Server instances using the REST API.
 
-**Version:** 3.0.0
+**Version:** 3.1.0
 **Author:** Delinea WW Architecture Team
 **Date:** January 2026
 
@@ -38,6 +38,9 @@ Interactive wizard for migrating secrets between Secret Server instances using t
 | **Secret Policies** | Create | Checkout, expiration, session recording settings |
 | **Secrets** | Create | All fields, custom fields, expiration dates |
 | **RPC/Privileged Account Links** | Create | Two-pass handles dependencies |
+| **Scripts** | Create | PowerShell/SQL scripts for RPC (v3.1) |
+| **Password Types** | Create | Custom password changers with script remapping (v3.1) |
+| **Lists** | Create | Dropdown options for template fields (v3.1) |
 | **Sites** | Map Only | Must exist on target; IDs mapped automatically |
 | **Secret Templates** | Map Only | Must exist on target with matching fields |
 
@@ -50,10 +53,7 @@ These objects require manual setup on target or Professional Services engagement
 | **Users** | Usually AD-synced | Configure AD sync on target |
 | **Groups** | Usually AD-synced | Configure AD sync on target |
 | **Roles** | Org-specific permissions | Recreate manually or use PS |
-| **Scripts** | Custom RPC scripts | Copy manually or use PS |
-| **Password Types** | RPC password changers | Configure manually or use PS |
 | **Launchers** | Session launch config | Configure manually |
-| **Lists** | Dropdown field options | Configure manually |
 | **Character Sets** | Password char rules | Quick to configure |
 | **Password Requirements** | Complexity rules | Quick to configure |
 | **Reports** | Custom reports | Recreate manually |
@@ -65,16 +65,14 @@ These objects require manual setup on target or Professional Services engagement
 
 After running this tool, you may need to:
 
-1. **RPC Configuration** - If source uses custom Scripts or Password Types, configure these on target first, then update secrets
-2. **Launcher Settings** - Configure any custom launchers used by migrated secrets
-3. **List Values** - If templates use dropdown lists, create those lists on target
-4. **Verify AD Sync** - Ensure users/groups are synced to target before granting access
+1. **Launcher Settings** - Configure any custom launchers used by migrated secrets
+2. **Verify AD Sync** - Ensure users/groups are synced to target before granting access
+3. **Verify RPC** - Test password rotation after migration to confirm scripts and password types work
 
 ### When to Use Professional Services
 
 Consider Delinea Professional Services if your migration involves:
 
-- Custom Scripts or Password Types (RPC won't work without them)
 - Event Pipelines or workflow automation
 - Complex role/permission structures
 - Multiple distributed engine sites
@@ -374,6 +372,16 @@ This toolkit is designed for **SE field portability**:
 ---
 
 ## Changelog
+
+### v3.1.0 (January 2026)
+**RPC Object Migration**
+
+- **Scripts Migration**: Export/import PowerShell and SQL scripts for RPC
+- **Password Types Migration**: Export/import custom password changers with automatic script ID remapping
+- **Lists Migration**: Export/import dropdown lists with all option items
+- **Pre-Flight Updates**: Scripts, Password Types, and Lists now show as "will be migrated" (not warnings)
+- **Dependency Order**: Sites → Templates → Scripts → Password Types → Lists → Folders → Policies → Secrets
+- **New Wizard Steps**: 5a-Scripts, 5b-PasswordTypes, 5c-Lists, 5d-Folders, 5e-Policies, 5f-PolicyAssign
 
 ### v3.0.0 (January 2026)
 **Full Migration Mode Release**

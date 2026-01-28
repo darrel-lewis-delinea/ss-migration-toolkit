@@ -24,9 +24,9 @@
 | E4002 | WARNING | Duplicate name on target | Handled per DuplicateNamePolicy |
 | E4003 | WARNING | Empty folder skipped | No action needed |
 | E4004 | WARNING | RPC config not migrated | Manual RPC setup required |
-| E4010 | WARNING | Custom scripts detected | Scripts not migrated; manual setup needed |
-| E4011 | WARNING | Custom password types detected | Password types not migrated; RPC may not work |
-| E4012 | WARNING | Lists detected | Lists not migrated; template dropdowns may not work |
+| E4010 | INFO | Custom scripts detected | Now migrated in v3.1; verify after migration |
+| E4011 | INFO | Custom password types detected | Now migrated in v3.1; verify RPC works |
+| E4012 | INFO | Lists detected | Now migrated in v3.1; verify template dropdowns |
 | E4013 | WARNING | Custom launchers detected | Launchers not migrated; configure manually |
 | E4014 | WARNING | Event pipelines detected | Pipelines not migrated; workflow automation needs PS |
 
@@ -387,40 +387,40 @@ This is rare but can occur when two service accounts authenticate each other (mu
 
 ## Unsupported Object Warnings (E4010-E4014)
 
-During pre-flight validation, you may see warnings about objects that this tool does not migrate. These are **warnings, not blockers** - the migration will proceed, but you'll need manual work afterward.
+During pre-flight validation, you may see information or warnings about objects. As of v3.1, Scripts, Password Types, and Lists are migrated automatically.
 
-### E4010: Custom Scripts Detected
+### E4010: Custom Scripts Detected (v3.1: Now Migrated)
 
 **What it means:** Source has PowerShell/SQL scripts used for RPC password changing.
 
-**Impact:** Secrets using custom password changers won't have working RPC on target.
+**Status:** ✅ **Automatically migrated in v3.1**
 
-**Resolution:**
-1. Export scripts manually from source (Admin > Scripts)
-2. Recreate on target before or after migration
-3. Update secrets to use the new script IDs
+**Post-migration verification:**
+1. In target Secret Server: Admin > Scripts
+2. Verify scripts exist with correct content
+3. Test RPC password rotation on a test secret
 
-### E4011: Custom Password Types Detected
+### E4011: Custom Password Types Detected (v3.1: Now Migrated)
 
 **What it means:** Source has custom password type definitions (how to change passwords on specific systems).
 
-**Impact:** RPC won't work for secrets using these password types.
+**Status:** ✅ **Automatically migrated in v3.1** (with script ID remapping)
 
-**Resolution:**
-1. Document password types from source (Admin > Remote Password Changing > Password Types)
-2. Recreate on target with same settings
-3. Scripts must exist first (see E4010)
+**Post-migration verification:**
+1. In target Secret Server: Admin > Remote Password Changing > Password Types
+2. Verify password types exist with correct script associations
+3. Test RPC heartbeat and password change on test secrets
 
-### E4012: Lists Detected
+### E4012: Lists Detected (v3.1: Now Migrated)
 
 **What it means:** Source has dropdown lists used in secret template fields.
 
-**Impact:** Template fields expecting list values may not work correctly.
+**Status:** ✅ **Automatically migrated in v3.1** (with all list items)
 
-**Resolution:**
-1. Export list values from source (Admin > Lists)
-2. Create lists on target before migration
-3. Ensure list names match exactly
+**Post-migration verification:**
+1. In target Secret Server: Admin > Lists
+2. Verify lists exist with all options
+3. Check template fields that use dropdown lists
 
 ### E4013: Custom Launchers Detected
 

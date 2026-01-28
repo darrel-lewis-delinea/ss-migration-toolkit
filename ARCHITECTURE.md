@@ -18,43 +18,53 @@ Objects must be migrated in a specific order due to dependencies:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│              FULL MIGRATION DEPENDENCY GRAPH                    │
+│              FULL MIGRATION DEPENDENCY GRAPH (v3.1)             │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
-│   ┌────────┐                                                   │
-│   │ SITES  │ (read-only - no creation, mapping only)           │
-│   └────┬───┘                                                   │
-│        │                                                        │
-│        ▼                                                        │
-│   ┌───────────┐      ┌──────────┐                              │
-│   │ TEMPLATES │      │ FOLDERS  │                              │
-│   └─────┬─────┘      └────┬─────┘                              │
-│         │                 │                                     │
-│         │     (no policy yet - policy may not exist)           │
-│         │                 │                                     │
-│         │            ┌────▼──────┐                              │
-│         │            │ POLICIES  │                              │
-│         │            └────┬──────┘                              │
-│         │                 │                                     │
-│         │            ┌────▼──────────┐                         │
-│         │            │ FOLDER-POLICY │ (assign policies to     │
-│         │            │ ASSIGNMENT    │  folders)               │
-│         │            └───────────────┘                         │
-│         │                                                       │
-│         └──────────┬─────────────────────────────────────────  │
-│                    │                                            │
-│               ┌────▼────┐                                      │
-│               │ SECRETS │ Pass 1: Create without RPC           │
-│               │ PASS 1  │                                      │
-│               └────┬────┘                                      │
-│                    │                                            │
-│               ┌────▼────┐                                      │
-│               │ SECRETS │ Pass 2: Link privileged accounts     │
-│               │ PASS 2  │ (skip circular references)           │
-│               └─────────┘                                      │
+│   ┌────────┐      ┌───────────┐                                │
+│   │ SITES  │      │ TEMPLATES │  (both read-only, mapping)     │
+│   └────┬───┘      └─────┬─────┘                                │
+│        │                │                                       │
+│        └───────┬────────┘                                       │
+│                │                                                 │
+│                ▼                                                 │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │           RPC INFRASTRUCTURE (v3.1)                      │  │
+│   │                                                          │  │
+│   │  ┌─────────┐      ┌────────────────┐      ┌───────┐     │  │
+│   │  │ SCRIPTS │ ───▶ │ PASSWORD TYPES │      │ LISTS │     │  │
+│   │  └─────────┘      └────────────────┘      └───────┘     │  │
+│   │      (Password Types reference Scripts via scriptId)     │  │
+│   └─────────────────────────────────────────────────────────┘  │
+│                │                                                 │
+│                ▼                                                 │
+│   ┌──────────┐      ┌──────────┐                               │
+│   │ FOLDERS  │      │ POLICIES │  (can be parallel)            │
+│   └────┬─────┘      └────┬─────┘                               │
+│        │                 │                                      │
+│        └────────┬────────┘                                      │
+│                 │                                                │
+│            ┌────▼──────────┐                                    │
+│            │ FOLDER-POLICY │ (assign policies to folders)       │
+│            │ ASSIGNMENT    │                                    │
+│            └───────┬───────┘                                    │
+│                    │                                             │
+│               ┌────▼────┐                                       │
+│               │ SECRETS │ Pass 1: Create without RPC            │
+│               │ PASS 1  │                                       │
+│               └────┬────┘                                       │
+│                    │                                             │
+│               ┌────▼────┐                                       │
+│               │ SECRETS │ Pass 2: Link privileged accounts      │
+│               │ PASS 2  │ (skip circular references)            │
+│               └─────────┘                                       │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+**v3.1 Addition:** Scripts → Password Types → Lists are now migrated automatically.
+Password Types reference Scripts (heartbeatScriptId, rpcScriptId), so Scripts must
+be created first. Lists are independent but grouped with RPC infrastructure.
 
 ### Why Two Passes for Secrets?
 
