@@ -68,6 +68,7 @@ $script:State = @{
     TargetToken = $null
     ExportedSecrets = @()
     ExportedScripts = @()       # v3.1: Scripts for RPC
+    ExportedPasswordTypes = @() # v3.1: Password changers for RPC
     ExportedFolders = @()       # v3.0: Folder hierarchy
     ExportedPolicies = @()      # v3.0: Secret policies
     ImportedSecrets = [System.Collections.ArrayList]::new()
@@ -85,6 +86,7 @@ $script:IdMap = @{
     Sites = @{}           # SourceSiteId → TargetSiteId
     Templates = @{}       # SourceTemplateId → TargetTemplateId
     Scripts = @{}         # SourceScriptId → TargetScriptId (v3.1)
+    PasswordTypes = @{}   # SourcePasswordTypeId → TargetPasswordTypeId (v3.1)
     Folders = @{}         # SourceFolderId → TargetFolderId
     Policies = @{}        # SourcePolicyId → TargetPolicyId
     Secrets = @{}         # SourceSecretId → TargetSecretId
@@ -2401,6 +2403,185 @@ function Import-Scripts {
 
 #endregion
 
+#region Password Types Migration (v3.1)
+
+function Export-PasswordTypes {
+    <#
+    .SYNOPSIS
+        Export custom password types from source
+    .DESCRIPTION
+        Fetches password type definitions used for RPC (Remote Password Changing).
+        These define how Secret Server changes passwords on different systems.
+        May reference Scripts for custom password changing logic.
+    #>
+    param(
+        [string]$BaseUrl,
+        [string]$Token
+    )
+
+    Write-Log "[$script:CorrelationId] Exporting password types from source..." -Level Info
+
+    $allPasswordTypes = [System.Collections.ArrayList]::new()
+
+    try {
+        $response = Invoke-SSApi -BaseUrl $BaseUrl -Endpoint "remote-password-changing/password-types" -Token $Token
+        $pwTypes = if ($response.records) { $response.records } elseif ($response) { @($response) } else { @() }
+
+        foreach ($pwType in $pwTypes) {
+            # Only export custom types (built-in types exist on target)
+            # Custom types typically have higher IDs or isCustom flag
+            if ($pwType.passwordTypeId -gt 100 -or $pwType.isCustom -eq $true -or $pwType.customPort -ne $null) {
+                try {
+                    # Get full details
+                    $details = Invoke-SSApi -BaseUrl $BaseUrl -Endpoint "remote-password-changing/password-types/$($pwType.passwordTypeId)" -Token $Token
+                    [void]$allPasswordTypes.Add([PSCustomObject]@{
+                        passwordTypeId = $details.passwordTypeId
+                        name = $details.name
+                        typeName = $details.typeName
+                        active = $details.active
+                        # Script references (will need ID mapping)
+                        heartbeatScriptId = $details.heartbeatScriptId
+                        rpcScriptId = $details.rpcScriptId
+                        # Other settings
+                        customPort = $details.customPort
+                        scanItemTemplateId = $details.scanItemTemplateId
+                        isCustom = $true
+                        # Store full object for any additional fields
+                        _raw = $details
+                    })
+                }
+                catch {
+                    Write-Log "[$script:CorrelationId] Failed to get details for password type $($pwType.passwordTypeId): $_" -Level Warning
+                }
+            }
+        }
+    }
+    catch {
+        Write-Log "[$script:CorrelationId] Error fetching password types: $_" -Level Error
+        return @()
+    }
+
+    Write-Log "[$script:CorrelationId] Exported $($allPasswordTypes.Count) custom password types" -Level Success
+    return $allPasswordTypes
+}
+
+function Import-PasswordTypes {
+    <#
+    .SYNOPSIS
+        Import password types to target
+    .DESCRIPTION
+        Creates password types on target and records ID mapping.
+        Remaps Script references using the Scripts IdMap.
+    #>
+    param(
+        [string]$BaseUrl,
+        [string]$Token,
+        [array]$PasswordTypes
+    )
+
+    if ($PasswordTypes.Count -eq 0) {
+        Write-Log "[$script:CorrelationId] No password types to import" -Level Info
+        return @{ Success = @(); Failed = @(); Skipped = @() }
+    }
+
+    Write-Log "[$script:CorrelationId] Importing $($PasswordTypes.Count) password types..." -Level Info
+
+    $results = @{
+        Success = [System.Collections.ArrayList]::new()
+        Failed = [System.Collections.ArrayList]::new()
+        Skipped = [System.Collections.ArrayList]::new()
+    }
+
+    # Get existing password types on target for duplicate detection
+    $existingTypes = @{}
+    try {
+        $response = Invoke-SSApi -BaseUrl $BaseUrl -Endpoint "remote-password-changing/password-types" -Token $Token
+        $targetTypes = if ($response.records) { $response.records } else { @() }
+        foreach ($t in $targetTypes) {
+            $existingTypes[$t.name.ToLower()] = $t
+        }
+    }
+    catch {
+        Write-Log "[$script:CorrelationId] Could not fetch existing password types from target: $_" -Level Warning
+    }
+
+    $count = 0
+    foreach ($pwType in $PasswordTypes) {
+        $count++
+        Show-Progress -Activity "Importing password types" -Current $count -Total $PasswordTypes.Count
+
+        # Check for duplicate by name
+        $existingMatch = $existingTypes[$pwType.name.ToLower()]
+        if ($existingMatch) {
+            Write-Log "[$script:CorrelationId] Password type '$($pwType.name)' already exists on target (ID: $($existingMatch.passwordTypeId)), mapping" -Level Info
+            Set-IdMapping -ObjectType 'PasswordTypes' -SourceId $pwType.passwordTypeId -TargetId $existingMatch.passwordTypeId -Name $pwType.name
+            [void]$results.Skipped.Add([PSCustomObject]@{
+                SourceId = $pwType.passwordTypeId
+                TargetId = $existingMatch.passwordTypeId
+                Name = $pwType.name
+                Reason = "Already exists"
+            })
+            continue
+        }
+
+        try {
+            # Remap script IDs if present
+            $targetHeartbeatScriptId = $null
+            $targetRpcScriptId = $null
+
+            if ($pwType.heartbeatScriptId) {
+                $targetHeartbeatScriptId = Get-IdMapping -ObjectType 'Scripts' -SourceId $pwType.heartbeatScriptId
+                if (-not $targetHeartbeatScriptId) {
+                    Write-Log "[$script:CorrelationId] Warning: Heartbeat script $($pwType.heartbeatScriptId) not found in mapping for '$($pwType.name)'" -Level Warning
+                }
+            }
+
+            if ($pwType.rpcScriptId) {
+                $targetRpcScriptId = Get-IdMapping -ObjectType 'Scripts' -SourceId $pwType.rpcScriptId
+                if (-not $targetRpcScriptId) {
+                    Write-Log "[$script:CorrelationId] Warning: RPC script $($pwType.rpcScriptId) not found in mapping for '$($pwType.name)'" -Level Warning
+                }
+            }
+
+            $body = @{
+                name = $pwType.name
+                typeName = $pwType.typeName
+                active = $pwType.active
+            }
+
+            # Add script references if mapped
+            if ($targetHeartbeatScriptId) { $body.heartbeatScriptId = $targetHeartbeatScriptId }
+            if ($targetRpcScriptId) { $body.rpcScriptId = $targetRpcScriptId }
+            if ($pwType.customPort) { $body.customPort = $pwType.customPort }
+
+            $result = Invoke-SSApi -BaseUrl $BaseUrl -Endpoint "remote-password-changing/password-types" -Token $Token -Method Post -Body $body
+
+            Set-IdMapping -ObjectType 'PasswordTypes' -SourceId $pwType.passwordTypeId -TargetId $result.passwordTypeId -Name $pwType.name
+
+            [void]$results.Success.Add([PSCustomObject]@{
+                SourceId = $pwType.passwordTypeId
+                TargetId = $result.passwordTypeId
+                Name = $pwType.name
+            })
+
+            Write-Log "[$script:CorrelationId] Created password type '$($pwType.name)' (Source: $($pwType.passwordTypeId) → Target: $($result.passwordTypeId))" -Level Info
+        }
+        catch {
+            Write-Log "[$script:CorrelationId] Failed to create password type '$($pwType.name)': $_" -Level Error
+            [void]$results.Failed.Add([PSCustomObject]@{
+                SourceId = $pwType.passwordTypeId
+                Name = $pwType.name
+                Error = $_.Exception.Message
+            })
+        }
+    }
+
+    Write-Log "[$script:CorrelationId] Password types import complete: $($results.Success.Count) created, $($results.Skipped.Count) existing, $($results.Failed.Count) failed" -Level Success
+    return $results
+}
+
+#endregion
+
 #region Folder Migration (v3.0)
 
 function Export-Folders {
@@ -3177,13 +3358,16 @@ function Start-FullMigration {
     Write-Log "Duplicate policy set to: $($script:Config.DuplicateNamePolicy)" -Level Info
 
     # Step 3: Export
-    # Step 3: Export (scripts/folders/policies if Full mode, then secrets)
+    # Step 3: Export (scripts/password types/folders/policies if Full mode, then secrets)
     if ($script:MigrationMode -eq "Full") {
-        Write-Host "`nSTEP 3a: Export Scripts, Folders & Policies" -ForegroundColor Cyan
-        Write-Host "-------------------------------------------`n"
+        Write-Host "`nSTEP 3a: Export RPC Config, Folders & Policies" -ForegroundColor Cyan
+        Write-Host "----------------------------------------------`n"
 
         Write-Log "Exporting scripts from source..." -Level Info
         $script:State.ExportedScripts = Export-Scripts -BaseUrl $script:State.SourceUrl -Token $script:State.SourceToken
+
+        Write-Log "Exporting password types from source..." -Level Info
+        $script:State.ExportedPasswordTypes = Export-PasswordTypes -BaseUrl $script:State.SourceUrl -Token $script:State.SourceToken
 
         Write-Log "Exporting folders from source..." -Level Info
         $script:State.ExportedFolders = Export-Folders -BaseUrl $script:State.SourceUrl -Token $script:State.SourceToken
@@ -3192,6 +3376,7 @@ function Start-FullMigration {
         $script:State.ExportedPolicies = Export-SecretPolicies -BaseUrl $script:State.SourceUrl -Token $script:State.SourceToken
 
         Write-Host "  Scripts: $($script:State.ExportedScripts.Count)" -ForegroundColor Green
+        Write-Host "  Password Types: $($script:State.ExportedPasswordTypes.Count)" -ForegroundColor Green
         Write-Host "  Folders: $($script:State.ExportedFolders.Count)" -ForegroundColor Green
         Write-Host "  Policies: $($script:State.ExportedPolicies.Count)" -ForegroundColor Green
     }
@@ -3287,7 +3472,7 @@ function Start-FullMigration {
     }
 
     # Step 5: Import
-    # Step 5: Import (scripts/folders/policies if Full mode, then secrets)
+    # Step 5: Import (scripts/password types/folders/policies if Full mode, then secrets)
     if ($script:MigrationMode -eq "Full") {
         # Scripts first (Password Types depend on them)
         if ($script:State.ExportedScripts -and $script:State.ExportedScripts.Count -gt 0) {
@@ -3304,7 +3489,22 @@ function Start-FullMigration {
             Save-Checkpoint
         }
 
-        Write-Host "`nSTEP 5b: Import Folders (Structure)" -ForegroundColor Cyan
+        # Password Types second (depend on Scripts, needed by Secrets for RPC)
+        if ($script:State.ExportedPasswordTypes -and $script:State.ExportedPasswordTypes.Count -gt 0) {
+            Write-Host "`nSTEP 5b: Import Password Types" -ForegroundColor Cyan
+            Write-Host "------------------------------`n"
+
+            if (-not (Read-Confirmation "Create $($script:State.ExportedPasswordTypes.Count) password types on target?")) {
+                Write-Log "Password type import cancelled." -Level Warning
+                return
+            }
+
+            $pwTypeResults = Import-PasswordTypes -BaseUrl $script:State.TargetUrl -Token $script:State.TargetToken -PasswordTypes $script:State.ExportedPasswordTypes
+            Write-Host "  Created: $($pwTypeResults.Success.Count), Existing: $($pwTypeResults.Skipped.Count), Failed: $($pwTypeResults.Failed.Count)" -ForegroundColor $(if ($pwTypeResults.Failed.Count -gt 0) { 'Yellow' } else { 'Green' })
+            Save-Checkpoint
+        }
+
+        Write-Host "`nSTEP 5c: Import Folders (Structure)" -ForegroundColor Cyan
         Write-Host "-----------------------------------`n"
 
         Write-Host "╔════════════════════════════════════════════════════════════╗" -ForegroundColor Red
