@@ -67,6 +67,9 @@ $script:State = @{
     SourceToken = $null
     TargetToken = $null
     ExportedSecrets = @()
+    ExportedScripts = @()       # v3.1: Scripts for RPC
+    ExportedFolders = @()       # v3.0: Folder hierarchy
+    ExportedPolicies = @()      # v3.0: Secret policies
     ImportedSecrets = [System.Collections.ArrayList]::new()
     FailedSecrets = [System.Collections.ArrayList]::new()
     CurrentPhase = "Init"
@@ -81,6 +84,7 @@ $script:State = @{
 $script:IdMap = @{
     Sites = @{}           # SourceSiteId → TargetSiteId
     Templates = @{}       # SourceTemplateId → TargetTemplateId
+    Scripts = @{}         # SourceScriptId → TargetScriptId (v3.1)
     Folders = @{}         # SourceFolderId → TargetFolderId
     Policies = @{}        # SourcePolicyId → TargetPolicyId
     Secrets = @{}         # SourceSecretId → TargetSecretId
@@ -2228,6 +2232,175 @@ function Test-Migration {
     }
 }
 
+#region Scripts Migration (v3.1)
+
+function Export-Scripts {
+    <#
+    .SYNOPSIS
+        Export all user scripts from source
+    .DESCRIPTION
+        Fetches scripts used for password changing, heartbeat, and other RPC operations.
+        These are essential for RPC to work after migration.
+    #>
+    param(
+        [string]$BaseUrl,
+        [string]$Token
+    )
+
+    Write-Log "[$script:CorrelationId] Exporting scripts from source..." -Level Info
+
+    $allScripts = [System.Collections.ArrayList]::new()
+
+    try {
+        $response = Invoke-SSApi -BaseUrl $BaseUrl -Endpoint "userscripts" -Token $Token
+        $scripts = if ($response.records) { $response.records } elseif ($response) { @($response) } else { @() }
+
+        foreach ($script in $scripts) {
+            # Get full script details including the actual script content
+            try {
+                $details = Invoke-SSApi -BaseUrl $BaseUrl -Endpoint "userscripts/$($script.userScriptId)" -Token $Token
+                [void]$allScripts.Add([PSCustomObject]@{
+                    userScriptId = $details.userScriptId
+                    name = $details.name
+                    description = $details.description
+                    script = $details.script
+                    scriptType = $details.scriptType          # PowerShell, SQL, SSH
+                    active = $details.active
+                    version = $details.version
+                    concurrencyId = $details.concurrencyId
+                })
+            }
+            catch {
+                Write-Log "[$script:CorrelationId] Failed to get details for script $($script.userScriptId): $_" -Level Warning
+                # Add basic info without script content
+                [void]$allScripts.Add([PSCustomObject]@{
+                    userScriptId = $script.userScriptId
+                    name = $script.name
+                    description = $script.description
+                    script = $null
+                    scriptType = $script.scriptType
+                    active = $script.active
+                    version = $null
+                    concurrencyId = $null
+                })
+            }
+        }
+    }
+    catch {
+        Write-Log "[$script:CorrelationId] Error fetching scripts: $_" -Level Error
+        return @()
+    }
+
+    Write-Log "[$script:CorrelationId] Exported $($allScripts.Count) scripts" -Level Success
+    return $allScripts
+}
+
+function Import-Scripts {
+    <#
+    .SYNOPSIS
+        Import scripts to target
+    .DESCRIPTION
+        Creates scripts on target and records ID mapping for Password Type references.
+    #>
+    param(
+        [string]$BaseUrl,
+        [string]$Token,
+        [array]$Scripts
+    )
+
+    if ($Scripts.Count -eq 0) {
+        Write-Log "[$script:CorrelationId] No scripts to import" -Level Info
+        return @{ Success = @(); Failed = @(); Skipped = @() }
+    }
+
+    Write-Log "[$script:CorrelationId] Importing $($Scripts.Count) scripts..." -Level Info
+
+    $results = @{
+        Success = [System.Collections.ArrayList]::new()
+        Failed = [System.Collections.ArrayList]::new()
+        Skipped = [System.Collections.ArrayList]::new()
+    }
+
+    # Get existing scripts on target for duplicate detection
+    $existingScripts = @{}
+    try {
+        $response = Invoke-SSApi -BaseUrl $BaseUrl -Endpoint "userscripts" -Token $Token
+        $targetScripts = if ($response.records) { $response.records } else { @() }
+        foreach ($s in $targetScripts) {
+            $existingScripts[$s.name.ToLower()] = $s
+        }
+    }
+    catch {
+        Write-Log "[$script:CorrelationId] Could not fetch existing scripts from target: $_" -Level Warning
+    }
+
+    $count = 0
+    foreach ($script in $Scripts) {
+        $count++
+        Show-Progress -Activity "Importing scripts" -Current $count -Total $Scripts.Count
+
+        # Check for duplicate by name
+        $existingMatch = $existingScripts[$script.name.ToLower()]
+        if ($existingMatch) {
+            Write-Log "[$script:CorrelationId] Script '$($script.name)' already exists on target (ID: $($existingMatch.userScriptId)), mapping" -Level Info
+            Set-IdMapping -ObjectType 'Scripts' -SourceId $script.userScriptId -TargetId $existingMatch.userScriptId -Name $script.name
+            [void]$results.Skipped.Add([PSCustomObject]@{
+                SourceId = $script.userScriptId
+                TargetId = $existingMatch.userScriptId
+                Name = $script.name
+                Reason = "Already exists"
+            })
+            continue
+        }
+
+        # Skip if we don't have the script content
+        if (-not $script.script) {
+            Write-Log "[$script:CorrelationId] Script '$($script.name)' has no content, skipping" -Level Warning
+            [void]$results.Failed.Add([PSCustomObject]@{
+                SourceId = $script.userScriptId
+                Name = $script.name
+                Error = "No script content available"
+            })
+            continue
+        }
+
+        try {
+            $body = @{
+                name = $script.name
+                description = $script.description
+                script = $script.script
+                scriptType = $script.scriptType
+                active = $script.active
+            }
+
+            $result = Invoke-SSApi -BaseUrl $BaseUrl -Endpoint "userscripts" -Token $Token -Method Post -Body $body
+
+            Set-IdMapping -ObjectType 'Scripts' -SourceId $script.userScriptId -TargetId $result.userScriptId -Name $script.name
+
+            [void]$results.Success.Add([PSCustomObject]@{
+                SourceId = $script.userScriptId
+                TargetId = $result.userScriptId
+                Name = $script.name
+            })
+
+            Write-Log "[$script:CorrelationId] Created script '$($script.name)' (Source: $($script.userScriptId) → Target: $($result.userScriptId))" -Level Info
+        }
+        catch {
+            Write-Log "[$script:CorrelationId] Failed to create script '$($script.name)': $_" -Level Error
+            [void]$results.Failed.Add([PSCustomObject]@{
+                SourceId = $script.userScriptId
+                Name = $script.name
+                Error = $_.Exception.Message
+            })
+        }
+    }
+
+    Write-Log "[$script:CorrelationId] Scripts import complete: $($results.Success.Count) created, $($results.Skipped.Count) existing, $($results.Failed.Count) failed" -Level Success
+    return $results
+}
+
+#endregion
+
 #region Folder Migration (v3.0)
 
 function Export-Folders {
@@ -3004,10 +3177,13 @@ function Start-FullMigration {
     Write-Log "Duplicate policy set to: $($script:Config.DuplicateNamePolicy)" -Level Info
 
     # Step 3: Export
-    # Step 3: Export (folders/policies if Full mode, then secrets)
+    # Step 3: Export (scripts/folders/policies if Full mode, then secrets)
     if ($script:MigrationMode -eq "Full") {
-        Write-Host "`nSTEP 3a: Export Folders & Policies" -ForegroundColor Cyan
-        Write-Host "----------------------------------`n"
+        Write-Host "`nSTEP 3a: Export Scripts, Folders & Policies" -ForegroundColor Cyan
+        Write-Host "-------------------------------------------`n"
+
+        Write-Log "Exporting scripts from source..." -Level Info
+        $script:State.ExportedScripts = Export-Scripts -BaseUrl $script:State.SourceUrl -Token $script:State.SourceToken
 
         Write-Log "Exporting folders from source..." -Level Info
         $script:State.ExportedFolders = Export-Folders -BaseUrl $script:State.SourceUrl -Token $script:State.SourceToken
@@ -3015,6 +3191,7 @@ function Start-FullMigration {
         Write-Log "Exporting secret policies from source..." -Level Info
         $script:State.ExportedPolicies = Export-SecretPolicies -BaseUrl $script:State.SourceUrl -Token $script:State.SourceToken
 
+        Write-Host "  Scripts: $($script:State.ExportedScripts.Count)" -ForegroundColor Green
         Write-Host "  Folders: $($script:State.ExportedFolders.Count)" -ForegroundColor Green
         Write-Host "  Policies: $($script:State.ExportedPolicies.Count)" -ForegroundColor Green
     }
@@ -3110,9 +3287,24 @@ function Start-FullMigration {
     }
 
     # Step 5: Import
-    # Step 5: Import (folders/policies if Full mode, then secrets)
+    # Step 5: Import (scripts/folders/policies if Full mode, then secrets)
     if ($script:MigrationMode -eq "Full") {
-        Write-Host "`nSTEP 5a: Import Folders (Structure)" -ForegroundColor Cyan
+        # Scripts first (Password Types depend on them)
+        if ($script:State.ExportedScripts -and $script:State.ExportedScripts.Count -gt 0) {
+            Write-Host "`nSTEP 5a: Import Scripts" -ForegroundColor Cyan
+            Write-Host "-----------------------`n"
+
+            if (-not (Read-Confirmation "Create $($script:State.ExportedScripts.Count) scripts on target?")) {
+                Write-Log "Script import cancelled." -Level Warning
+                return
+            }
+
+            $scriptResults = Import-Scripts -BaseUrl $script:State.TargetUrl -Token $script:State.TargetToken -Scripts $script:State.ExportedScripts
+            Write-Host "  Created: $($scriptResults.Success.Count), Existing: $($scriptResults.Skipped.Count), Failed: $($scriptResults.Failed.Count)" -ForegroundColor $(if ($scriptResults.Failed.Count -gt 0) { 'Yellow' } else { 'Green' })
+            Save-Checkpoint
+        }
+
+        Write-Host "`nSTEP 5b: Import Folders (Structure)" -ForegroundColor Cyan
         Write-Host "-----------------------------------`n"
 
         Write-Host "╔════════════════════════════════════════════════════════════╗" -ForegroundColor Red
@@ -3128,7 +3320,7 @@ function Start-FullMigration {
         $folderResults = Import-FoldersPass1 -TargetUrl $script:State.TargetUrl -TargetToken $script:State.TargetToken -Folders $script:State.ExportedFolders
         Save-Checkpoint
 
-        Write-Host "`nSTEP 5b: Import Secret Policies" -ForegroundColor Cyan
+        Write-Host "`nSTEP 5c: Import Secret Policies" -ForegroundColor Cyan
         Write-Host "-------------------------------`n"
 
         if ($script:State.ExportedPolicies.Count -gt 0) {
