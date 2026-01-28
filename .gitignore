@@ -1,0 +1,27 @@
+# Secret Server Migration Toolkit - Git Ignore
+
+# Export files contain secrets - NEVER commit these
+ss-export-*.json
+
+# State and checkpoint files
+ss-migrate-checkpoint.json
+ss-migrate-failures.json
+
+# Log files
+ss-migrate-*.log
+*.log
+
+# Release zip files (store in GitHub Releases instead)
+*.zip
+
+# macOS
+.DS_Store
+
+# PowerShell temp files
+*.tmp
+
+# Editor files
+*.swp
+*~
+.vscode/
+.idea/
