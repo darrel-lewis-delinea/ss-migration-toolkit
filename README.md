@@ -10,13 +10,7 @@ Interactive wizard for migrating secrets between Secret Server instances using t
 
 ## Why This Tool?
 
-| Method | Time | Cost | Preserves Expiry |
-|--------|------|------|------------------|
-| Professional Services | 3 months | $130K+ | Maybe |
-| CSV Import | Days | Free | **No** |
-| **This Toolkit** | Hours | Free | **Yes** |
-
-The July 2025 Secret Server release optimized bulk operations for "tens of thousands of secrets" with 20% performance improvement. This toolkit leverages those improvements.
+Unlike CSV import, this toolkit preserves all secret fields including expiration dates. The July 2025 Secret Server release optimized bulk operations for "tens of thousands of secrets" with 20% performance improvement. This toolkit leverages those improvements.
 
 ---
 
