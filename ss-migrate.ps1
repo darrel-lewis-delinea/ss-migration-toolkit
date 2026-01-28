@@ -67,8 +67,8 @@ $script:State = @{
     SourceToken = $null
     TargetToken = $null
     ExportedSecrets = @()
-    ImportedSecrets = @()
-    FailedSecrets = @()
+    ImportedSecrets = [System.Collections.ArrayList]::new()
+    FailedSecrets = [System.Collections.ArrayList]::new()
     CurrentPhase = "Init"
     LastBatchIndex = 0
     # Token management for long-running migrations
@@ -1954,7 +1954,7 @@ function Import-Secrets {
                     })
                 }
 
-                $script:State.ImportedSecrets += $results.Success[-1]
+                [void]$script:State.ImportedSecrets.Add($results.Success[-1])
             }
 
             # Track this name in our batch (for detecting duplicates within import)
@@ -1969,7 +1969,7 @@ function Import-Secrets {
                 Error = $_.Exception.Message
             })
 
-            $script:State.FailedSecrets += $results.Failed[-1]
+            [void]$script:State.FailedSecrets.Add($results.Failed[-1])
             Write-Log "Failed to import secret ID $($secret.id) '$($secret.name)': $($_.Exception.Message)" -Level Error
 
             # If policy is Fail and this is a duplicate error, stop the import
