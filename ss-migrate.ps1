@@ -874,7 +874,7 @@ function Set-IdMapping {
         Optional name for debugging
     #>
     param(
-        [ValidateSet('Sites', 'Templates', 'Folders', 'Policies', 'Secrets')]
+        [ValidateSet('Sites', 'Templates', 'Scripts', 'PasswordTypes', 'Lists', 'Folders', 'Policies', 'Secrets')]
         [string]$ObjectType,
         [int]$SourceId,
         [int]$TargetId,
@@ -897,7 +897,7 @@ function Get-MappedId {
         Target ID if mapped, $null if not found
     #>
     param(
-        [ValidateSet('Sites', 'Templates', 'Folders', 'Policies', 'Secrets')]
+        [ValidateSet('Sites', 'Templates', 'Scripts', 'PasswordTypes', 'Lists', 'Folders', 'Policies', 'Secrets')]
         [string]$ObjectType,
         [int]$SourceId
     )
@@ -916,7 +916,7 @@ function Test-IdMapping {
         Check if a source ID has been mapped
     #>
     param(
-        [ValidateSet('Sites', 'Templates', 'Folders', 'Policies', 'Secrets')]
+        [ValidateSet('Sites', 'Templates', 'Scripts', 'PasswordTypes', 'Lists', 'Folders', 'Policies', 'Secrets')]
         [string]$ObjectType,
         [int]$SourceId
     )
