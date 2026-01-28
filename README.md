@@ -2,7 +2,7 @@
 
 Interactive wizard for migrating secrets between Secret Server instances using the REST API.
 
-**Version:** 2.2.3
+**Version:** 2.2.4
 **Author:** Delinea WW Architecture Team
 **Date:** January 2026
 
@@ -236,7 +236,7 @@ See `TROUBLESHOOTING.md` for common issues:
 ```
   ╔═══════════════════════════════════════════════════════════════╗
   ║   SECRET SERVER MIGRATION TOOLKIT                             ║
-  ║   Version 2.2.3                                               ║
+  ║   Version 2.2.4                                               ║
   ╚═══════════════════════════════════════════════════════════════╝
 
 What would you like to do?
@@ -352,6 +352,11 @@ REMINDER: Delete or secure the export file - it contains secrets in clear text.
 ---
 
 ## Changelog
+
+### v2.2.4 (January 2026)
+- **UX**: URL validation now offers retry instead of exiting on invalid input
+- **UX**: Auto-suggests `https://` prefix when missing (prompts user to confirm)
+- **UX**: Added example URL format to target prompt for consistency
 
 ### v2.2.3 (January 2026)
 - **Security**: Added `ZeroFreeBSTR` to securely clear password from unmanaged memory after OAuth

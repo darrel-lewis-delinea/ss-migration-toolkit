@@ -31,7 +31,7 @@ param(
 
 #region Configuration
 $script:Config = @{
-    Version = "2.2.3"
+    Version = "2.2.4"
     BatchSize = 500
     ThrottleDelayMs = 200  # Conservative default for large migrations; increase if hitting rate limits
     ConnectionTimeoutSec = 30
@@ -569,7 +569,7 @@ function Test-Url {
     param([string]$Url)
 
     if (-not $Url.StartsWith("https://")) {
-        return @{ Valid = $false; Error = "URL must start with https://" }
+        return @{ Valid = $false; Error = "URL must start with https://"; Suggestion = "https://$Url" }
     }
 
     try {
@@ -577,10 +577,46 @@ function Test-Url {
         if (-not $uri.Host) {
             return @{ Valid = $false; Error = "Invalid hostname" }
         }
-        return @{ Valid = $true }
+        return @{ Valid = $true; Url = $Url }
     }
     catch {
-        return @{ Valid = $false; Error = "Invalid URL format" }
+        return @{ Valid = $false; Error = "Invalid URL format: $($_.Exception.Message)" }
+    }
+}
+
+function Read-UrlWithRetry {
+    param(
+        [string]$Prompt,
+        [string]$Label
+    )
+
+    while ($true) {
+        $url = Read-Prompt -Prompt $Prompt -Required
+        $urlCheck = Test-Url $url
+
+        if ($urlCheck.Valid) {
+            return $url
+        }
+
+        Write-Host "  [ERROR] $($urlCheck.Error)" -ForegroundColor Red
+
+        # Offer suggestion if we have one
+        if ($urlCheck.Suggestion) {
+            $useSuggestion = Read-Prompt -Prompt "  Did you mean '$($urlCheck.Suggestion)'? [Y/n]"
+            if ($useSuggestion -ne 'n' -and $useSuggestion -ne 'N') {
+                $suggestionCheck = Test-Url $urlCheck.Suggestion
+                if ($suggestionCheck.Valid) {
+                    Write-Host "  Using: $($urlCheck.Suggestion)" -ForegroundColor Green
+                    return $urlCheck.Suggestion
+                }
+            }
+        }
+
+        $retry = Read-Prompt -Prompt "  Try again? [Y/n]"
+        if ($retry -eq 'n' -or $retry -eq 'N') {
+            return $null
+        }
+        Write-Host ""
     }
 }
 
@@ -1293,11 +1329,9 @@ function Start-FullMigration {
 
     # Source
     Write-Host "SOURCE Secret Server (where secrets are now):" -ForegroundColor Yellow
-    $script:State.SourceUrl = Read-Prompt -Prompt "Source URL (e.g., https://company.secretservercloud.com)" -Required
-
-    $urlCheck = Test-Url $script:State.SourceUrl
-    if (-not $urlCheck.Valid) {
-        Write-Log $urlCheck.Error -Level Error
+    $script:State.SourceUrl = Read-UrlWithRetry -Prompt "Source URL (e.g., https://company.secretservercloud.com)" -Label "Source"
+    if (-not $script:State.SourceUrl) {
+        Write-Log "Source URL required. Exiting." -Level Error
         return
     }
 
@@ -1306,11 +1340,9 @@ function Start-FullMigration {
 
     # Target
     Write-Host "`nTARGET Secret Server (where secrets will go):" -ForegroundColor Yellow
-    $script:State.TargetUrl = Read-Prompt -Prompt "Target URL" -Required
-
-    $urlCheck = Test-Url $script:State.TargetUrl
-    if (-not $urlCheck.Valid) {
-        Write-Log $urlCheck.Error -Level Error
+    $script:State.TargetUrl = Read-UrlWithRetry -Prompt "Target URL (e.g., https://company.secretservercloud.com)" -Label "Target"
+    if (-not $script:State.TargetUrl) {
+        Write-Log "Target URL required. Exiting." -Level Error
         return
     }
 
