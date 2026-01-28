@@ -2,7 +2,7 @@
 
 Interactive wizard for migrating secrets between Secret Server instances using the REST API.
 
-**Version:** 2.2.4
+**Version:** 2.2.5
 **Author:** Delinea WW Architecture Team
 **Date:** January 2026
 
@@ -346,6 +346,10 @@ REMINDER: Delete or secure the export file - it contains secrets in clear text.
 ---
 
 ## Changelog
+
+### v2.2.5 (January 2026)
+- **Bugfix**: Fixed menu index off-by-one error in duplicate policy selection (Show-Menu returns 0-indexed)
+- **Bugfix**: Fixed version mismatch between .NOTES header and Config
 
 ### v2.2.4 (January 2026)
 - **UX**: URL validation now offers retry instead of exiting on invalid input

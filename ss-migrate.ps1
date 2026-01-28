@@ -16,7 +16,7 @@
     ./ss-migrate.ps1 -Help
     Shows detailed help
 .NOTES
-    Version: 2.1
+    Version: 2.2.5
     Author: Delinea WW Architecture Team
     Requires: PowerShell 7+, TLS 1.2/1.3
 #>
@@ -31,7 +31,7 @@ param(
 
 #region Configuration
 $script:Config = @{
-    Version = "2.2.4"
+    Version = "2.2.5"
     BatchSize = 500
     ThrottleDelayMs = 200  # Conservative default for large migrations; increase if hitting rate limits
     ConnectionTimeoutSec = 30
@@ -1420,10 +1420,10 @@ function Start-FullMigration {
     )
 
     $script:Config.DuplicateNamePolicy = switch ($policyChoice) {
-        1 { "TrustTarget" }
-        2 { "Fail" }
-        3 { "Skip" }
-        4 { "Rename" }
+        0 { "TrustTarget" }
+        1 { "Fail" }
+        2 { "Skip" }
+        3 { "Rename" }
     }
 
     Write-Log "Duplicate policy set to: $($script:Config.DuplicateNamePolicy)" -Level Info
@@ -1482,19 +1482,22 @@ function Start-FullMigration {
                 )
 
                 switch ($changePolicy) {
-                    2 {
+                    0 {
+                        # Continue with Fail policy - no change needed
+                    }
+                    1 {
                         $script:Config.DuplicateNamePolicy = "Skip"
                         Write-Log "Policy changed to: Skip" -Level Info
                     }
-                    3 {
+                    2 {
                         $script:Config.DuplicateNamePolicy = "Rename"
                         Write-Log "Policy changed to: Rename" -Level Info
                     }
-                    4 {
+                    3 {
                         $script:Config.DuplicateNamePolicy = "TrustTarget"
                         Write-Log "Policy changed to: TrustTarget" -Level Info
                     }
-                    5 {
+                    4 {
                         Write-Log "Migration cancelled." -Level Warning
                         return
                     }
