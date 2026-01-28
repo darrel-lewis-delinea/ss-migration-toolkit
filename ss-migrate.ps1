@@ -69,6 +69,7 @@ $script:State = @{
     ExportedSecrets = @()
     ExportedScripts = @()       # v3.1: Scripts for RPC
     ExportedPasswordTypes = @() # v3.1: Password changers for RPC
+    ExportedLists = @()         # v3.1: Dropdown lists for templates
     ExportedFolders = @()       # v3.0: Folder hierarchy
     ExportedPolicies = @()      # v3.0: Secret policies
     ImportedSecrets = [System.Collections.ArrayList]::new()
@@ -87,6 +88,7 @@ $script:IdMap = @{
     Templates = @{}       # SourceTemplateId → TargetTemplateId
     Scripts = @{}         # SourceScriptId → TargetScriptId (v3.1)
     PasswordTypes = @{}   # SourcePasswordTypeId → TargetPasswordTypeId (v3.1)
+    Lists = @{}           # SourceListId → TargetListId (v3.1)
     Folders = @{}         # SourceFolderId → TargetFolderId
     Policies = @{}        # SourcePolicyId → TargetPolicyId
     Secrets = @{}         # SourceSecretId → TargetSecretId
@@ -1390,44 +1392,38 @@ function Test-UnsupportedObjects {
     $warnings = @()
     $manualWorkItems = @()
 
-    # Check Scripts
+    # Check Scripts - v3.1: Now supported for migration
     try {
         $response = Invoke-RestMethod -Uri "$SourceUrl/api/v1/userscripts" -Headers $headers -Method Get -ErrorAction Stop
         $scriptCount = if ($response.records) { $response.records.Count } elseif ($response.Count) { $response.Count } else { 0 }
         if ($scriptCount -gt 0) {
-            $warnings += "[E4010] $scriptCount custom scripts detected - manual migration needed"
-            $manualWorkItems += "Scripts ($scriptCount): Export from Admin > Scripts, recreate on target"
-            Write-Log "[$script:CorrelationId] [E4010] Found $scriptCount scripts on source" -Level Warning
+            Write-Log "[$script:CorrelationId] Found $scriptCount scripts - will be migrated" -Level Info
         }
     }
     catch {
         Write-Log "[$script:CorrelationId] Could not check scripts: $($_.Exception.Message)" -Level Warning
     }
 
-    # Check Password Types (custom ones beyond defaults)
+    # Check Password Types - v3.1: Now supported for migration
     try {
         $response = Invoke-RestMethod -Uri "$SourceUrl/api/v1/remote-password-changing/password-types" -Headers $headers -Method Get -ErrorAction Stop
         $pwTypes = if ($response.records) { $response.records } elseif ($response) { $response } else { @() }
         # Filter to non-default types (default types have lower IDs, typically < 100)
         $customPwTypes = @($pwTypes | Where-Object { $_.id -gt 100 -or $_.isCustom -eq $true })
         if ($customPwTypes.Count -gt 0) {
-            $warnings += "[E4011] $($customPwTypes.Count) custom password types detected - RPC may not work"
-            $manualWorkItems += "Password Types ($($customPwTypes.Count)): Configure on target for RPC to work"
-            Write-Log "[$script:CorrelationId] [E4011] Found $($customPwTypes.Count) custom password types" -Level Warning
+            Write-Log "[$script:CorrelationId] Found $($customPwTypes.Count) custom password types - will be migrated" -Level Info
         }
     }
     catch {
         Write-Log "[$script:CorrelationId] Could not check password types: $($_.Exception.Message)" -Level Warning
     }
 
-    # Check Lists
+    # Check Lists - v3.1: Now supported for migration
     try {
         $response = Invoke-RestMethod -Uri "$SourceUrl/api/v1/lists" -Headers $headers -Method Get -ErrorAction Stop
         $listCount = if ($response.records) { $response.records.Count } elseif ($response.Count) { $response.Count } else { 0 }
         if ($listCount -gt 0) {
-            $warnings += "[E4012] $listCount lists detected - template dropdowns may not work"
-            $manualWorkItems += "Lists ($listCount): Create on target before migration"
-            Write-Log "[$script:CorrelationId] [E4012] Found $listCount lists on source" -Level Warning
+            Write-Log "[$script:CorrelationId] Found $listCount lists - will be migrated" -Level Info
         }
     }
     catch {
@@ -2582,6 +2578,186 @@ function Import-PasswordTypes {
 
 #endregion
 
+#region Lists Migration (v3.1)
+
+function Export-Lists {
+    <#
+    .SYNOPSIS
+        Export all lists from source
+    .DESCRIPTION
+        Fetches dropdown lists used in secret template fields.
+        Lists provide the available options for dropdown/list fields.
+    #>
+    param(
+        [string]$BaseUrl,
+        [string]$Token
+    )
+
+    Write-Log "[$script:CorrelationId] Exporting lists from source..." -Level Info
+
+    $allLists = [System.Collections.ArrayList]::new()
+
+    try {
+        $response = Invoke-SSApi -BaseUrl $BaseUrl -Endpoint "lists" -Token $Token
+        $lists = if ($response.records) { $response.records } elseif ($response) { @($response) } else { @() }
+
+        foreach ($list in $lists) {
+            try {
+                # Get full list details including items
+                $details = Invoke-SSApi -BaseUrl $BaseUrl -Endpoint "lists/$($list.categorizedListId)" -Token $Token
+
+                # Also get the list items/options
+                $itemsResponse = Invoke-SSApi -BaseUrl $BaseUrl -Endpoint "lists/$($list.categorizedListId)/options" -Token $Token -ErrorAction SilentlyContinue
+                $items = if ($itemsResponse.records) { $itemsResponse.records } elseif ($itemsResponse) { @($itemsResponse) } else { @() }
+
+                [void]$allLists.Add([PSCustomObject]@{
+                    categorizedListId = $details.categorizedListId
+                    name = $details.name
+                    description = $details.description
+                    active = $details.active
+                    items = $items
+                    _raw = $details
+                })
+            }
+            catch {
+                Write-Log "[$script:CorrelationId] Failed to get details for list $($list.categorizedListId): $_" -Level Warning
+                # Add basic info without items
+                [void]$allLists.Add([PSCustomObject]@{
+                    categorizedListId = $list.categorizedListId
+                    name = $list.name
+                    description = $list.description
+                    active = $list.active
+                    items = @()
+                    _raw = $null
+                })
+            }
+        }
+    }
+    catch {
+        Write-Log "[$script:CorrelationId] Error fetching lists: $_" -Level Error
+        return @()
+    }
+
+    Write-Log "[$script:CorrelationId] Exported $($allLists.Count) lists" -Level Success
+    return $allLists
+}
+
+function Import-Lists {
+    <#
+    .SYNOPSIS
+        Import lists to target
+    .DESCRIPTION
+        Creates lists on target with their items/options.
+        Records ID mapping for template field references.
+    #>
+    param(
+        [string]$BaseUrl,
+        [string]$Token,
+        [array]$Lists
+    )
+
+    if ($Lists.Count -eq 0) {
+        Write-Log "[$script:CorrelationId] No lists to import" -Level Info
+        return @{ Success = @(); Failed = @(); Skipped = @() }
+    }
+
+    Write-Log "[$script:CorrelationId] Importing $($Lists.Count) lists..." -Level Info
+
+    $results = @{
+        Success = [System.Collections.ArrayList]::new()
+        Failed = [System.Collections.ArrayList]::new()
+        Skipped = [System.Collections.ArrayList]::new()
+    }
+
+    # Get existing lists on target for duplicate detection
+    $existingLists = @{}
+    try {
+        $response = Invoke-SSApi -BaseUrl $BaseUrl -Endpoint "lists" -Token $Token
+        $targetLists = if ($response.records) { $response.records } else { @() }
+        foreach ($l in $targetLists) {
+            $existingLists[$l.name.ToLower()] = $l
+        }
+    }
+    catch {
+        Write-Log "[$script:CorrelationId] Could not fetch existing lists from target: $_" -Level Warning
+    }
+
+    $count = 0
+    foreach ($list in $Lists) {
+        $count++
+        Show-Progress -Activity "Importing lists" -Current $count -Total $Lists.Count
+
+        # Check for duplicate by name
+        $existingMatch = $existingLists[$list.name.ToLower()]
+        if ($existingMatch) {
+            Write-Log "[$script:CorrelationId] List '$($list.name)' already exists on target (ID: $($existingMatch.categorizedListId)), mapping" -Level Info
+            Set-IdMapping -ObjectType 'Lists' -SourceId $list.categorizedListId -TargetId $existingMatch.categorizedListId -Name $list.name
+            [void]$results.Skipped.Add([PSCustomObject]@{
+                SourceId = $list.categorizedListId
+                TargetId = $existingMatch.categorizedListId
+                Name = $list.name
+                Reason = "Already exists"
+            })
+            continue
+        }
+
+        try {
+            # Create the list
+            $body = @{
+                name = $list.name
+                description = $list.description
+                active = $list.active
+            }
+
+            $result = Invoke-SSApi -BaseUrl $BaseUrl -Endpoint "lists" -Token $Token -Method Post -Body $body
+
+            $newListId = $result.categorizedListId
+
+            # Add list items/options
+            $itemsCreated = 0
+            if ($list.items -and $list.items.Count -gt 0) {
+                foreach ($item in $list.items) {
+                    try {
+                        $itemBody = @{
+                            value = $item.value
+                            category = $item.category
+                        }
+                        Invoke-SSApi -BaseUrl $BaseUrl -Endpoint "lists/$newListId/options" -Token $Token -Method Post -Body $itemBody | Out-Null
+                        $itemsCreated++
+                    }
+                    catch {
+                        Write-Log "[$script:CorrelationId] Failed to add item '$($item.value)' to list '$($list.name)': $_" -Level Warning
+                    }
+                }
+            }
+
+            Set-IdMapping -ObjectType 'Lists' -SourceId $list.categorizedListId -TargetId $newListId -Name $list.name
+
+            [void]$results.Success.Add([PSCustomObject]@{
+                SourceId = $list.categorizedListId
+                TargetId = $newListId
+                Name = $list.name
+                ItemsCreated = $itemsCreated
+            })
+
+            Write-Log "[$script:CorrelationId] Created list '$($list.name)' with $itemsCreated items (Source: $($list.categorizedListId) → Target: $newListId)" -Level Info
+        }
+        catch {
+            Write-Log "[$script:CorrelationId] Failed to create list '$($list.name)': $_" -Level Error
+            [void]$results.Failed.Add([PSCustomObject]@{
+                SourceId = $list.categorizedListId
+                Name = $list.name
+                Error = $_.Exception.Message
+            })
+        }
+    }
+
+    Write-Log "[$script:CorrelationId] Lists import complete: $($results.Success.Count) created, $($results.Skipped.Count) existing, $($results.Failed.Count) failed" -Level Success
+    return $results
+}
+
+#endregion
+
 #region Folder Migration (v3.0)
 
 function Export-Folders {
@@ -3369,6 +3545,9 @@ function Start-FullMigration {
         Write-Log "Exporting password types from source..." -Level Info
         $script:State.ExportedPasswordTypes = Export-PasswordTypes -BaseUrl $script:State.SourceUrl -Token $script:State.SourceToken
 
+        Write-Log "Exporting lists from source..." -Level Info
+        $script:State.ExportedLists = Export-Lists -BaseUrl $script:State.SourceUrl -Token $script:State.SourceToken
+
         Write-Log "Exporting folders from source..." -Level Info
         $script:State.ExportedFolders = Export-Folders -BaseUrl $script:State.SourceUrl -Token $script:State.SourceToken
 
@@ -3377,6 +3556,7 @@ function Start-FullMigration {
 
         Write-Host "  Scripts: $($script:State.ExportedScripts.Count)" -ForegroundColor Green
         Write-Host "  Password Types: $($script:State.ExportedPasswordTypes.Count)" -ForegroundColor Green
+        Write-Host "  Lists: $($script:State.ExportedLists.Count)" -ForegroundColor Green
         Write-Host "  Folders: $($script:State.ExportedFolders.Count)" -ForegroundColor Green
         Write-Host "  Policies: $($script:State.ExportedPolicies.Count)" -ForegroundColor Green
     }
@@ -3504,7 +3684,22 @@ function Start-FullMigration {
             Save-Checkpoint
         }
 
-        Write-Host "`nSTEP 5c: Import Folders (Structure)" -ForegroundColor Cyan
+        # Step 5c: Import Lists
+        if ($script:State.ExportedLists -and $script:State.ExportedLists.Count -gt 0) {
+            Write-Host "`nSTEP 5c: Import Lists (Dropdown Options)" -ForegroundColor Cyan
+            Write-Host "-----------------------------------------`n"
+
+            if (-not (Read-Confirmation "Create $($script:State.ExportedLists.Count) lists on target?")) {
+                Write-Log "Lists import cancelled." -Level Warning
+                return
+            }
+
+            $listResults = Import-Lists -BaseUrl $script:State.TargetUrl -Token $script:State.TargetToken -Lists $script:State.ExportedLists
+            Write-Host "  Created: $($listResults.Success.Count), Existing: $($listResults.Skipped.Count), Failed: $($listResults.Failed.Count)" -ForegroundColor $(if ($listResults.Failed.Count -gt 0) { 'Yellow' } else { 'Green' })
+            Save-Checkpoint
+        }
+
+        Write-Host "`nSTEP 5d: Import Folders (Structure)" -ForegroundColor Cyan
         Write-Host "-----------------------------------`n"
 
         Write-Host "╔════════════════════════════════════════════════════════════╗" -ForegroundColor Red
@@ -3520,7 +3715,7 @@ function Start-FullMigration {
         $folderResults = Import-FoldersPass1 -TargetUrl $script:State.TargetUrl -TargetToken $script:State.TargetToken -Folders $script:State.ExportedFolders
         Save-Checkpoint
 
-        Write-Host "`nSTEP 5c: Import Secret Policies" -ForegroundColor Cyan
+        Write-Host "`nSTEP 5e: Import Secret Policies" -ForegroundColor Cyan
         Write-Host "-------------------------------`n"
 
         if ($script:State.ExportedPolicies.Count -gt 0) {
@@ -3574,7 +3769,7 @@ function Start-FullMigration {
 
     # Step 5d: Update folder policies (Full mode - Pass 2)
     if ($script:MigrationMode -eq "Full" -and $script:State.ExportedFolders.Count -gt 0) {
-        Write-Host "`nSTEP 5d: Assign Policies to Folders" -ForegroundColor Cyan
+        Write-Host "`nSTEP 5f: Assign Policies to Folders" -ForegroundColor Cyan
         Write-Host "-----------------------------------`n"
 
         $foldersWithPolicies = $script:State.ExportedFolders | Where-Object {
