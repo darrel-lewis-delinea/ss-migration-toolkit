@@ -1,5 +1,32 @@
 # Secret Server Migration Toolkit - Troubleshooting Guide
 
+## Error Code Reference (v3.0)
+
+| Code | Severity | Message | Resolution |
+|------|----------|---------|------------|
+| E1001 | FATAL | Authentication failed | Check credentials, verify API enabled |
+| E1002 | FATAL | Network unreachable | Check connectivity, firewall rules |
+| E1003 | FATAL | Invalid configuration | Fix config, re-run |
+| E1004 | FATAL | Incompatible API version | Verify SS version supports required endpoints |
+| E2001 | BLOCKING | Site not found on target | Create site manually OR remap secrets |
+| E2002 | BLOCKING | Template not found on target | Create template manually on target |
+| E2003 | BLOCKING | Folder path conflict | Choose: Skip / Merge / Rename / Fail |
+| E2004 | BLOCKING | Policy name conflict | Choose: Skip / Rename / Overwrite / Fail |
+| E2005 | BLOCKING | Required field missing | Check source data integrity |
+| E2006 | BLOCKING | Insufficient permissions | Grant required roles to API user |
+| E3001 | RECOVERABLE | Template field mismatch | Data loss for extra fields, logged |
+| E3002 | RECOVERABLE | Folder not found for secret | Secret placed in root or skipped |
+| E3003 | RECOVERABLE | Rate limit (retrying) | Auto-retry with backoff |
+| E3004 | RECOVERABLE | Single item API failure | Logged to failures file |
+| E3005 | RECOVERABLE | Privileged account not found | Secret created without RPC |
+| E3006 | RECOVERABLE | Circular RPC reference | Secret created without RPC link |
+| E4001 | WARNING | Field value truncated | Data loss, logged |
+| E4002 | WARNING | Duplicate name on target | Handled per DuplicateNamePolicy |
+| E4003 | WARNING | Empty folder skipped | No action needed |
+| E4004 | WARNING | RPC config not migrated | Manual RPC setup required |
+
+---
+
 ## Quick Diagnostics
 
 Run these commands to gather diagnostic info:
@@ -94,6 +121,16 @@ $env:HTTPS_PROXY = "http://proxy.company.com:8080"
 # Should show: Tls12 or Tls13
 # If not, the script sets this automatically - check for proxy/firewall interference
 ```
+
+#### "TOKEN REFRESH REQUIRED" prompt during migration
+
+**Problem:** OAuth tokens expire (typically 1 hour). For long migrations, you'll be prompted to re-authenticate.
+
+**This is expected behavior** - the toolkit tracks token expiry and prompts for re-authentication before major operations to prevent mid-migration failures.
+
+**Solutions:**
+1. Enter credentials when prompted to continue
+2. If you cancel, use `-Resume` to restart from checkpoint later
 
 ---
 
@@ -313,6 +350,33 @@ Get-Content ss-migrate-2026-01-27-*.log | Select-Object -Last 50
 # Extract all failed secrets
 Select-String -Path ss-migrate-*.log -Pattern "FAILED:"
 ```
+
+### Generated Files Reference
+
+| File | Purpose | When to Use |
+|------|---------|-------------|
+| `ss-migrate-*.log` | Full operation log | Troubleshooting any issue |
+| `ss-export-*.json` | Exported data (contains secrets!) | Re-import without re-export |
+| `ss-migrate-checkpoint.json` | Resume state with ID mappings | Resume interrupted migration |
+| `ss-migrate-failures.json` | List of failed items | Retry specific failures |
+| `ss-migrate-idmap.json` | Source→Target ID mappings (debug) | Verify what was created |
+
+**Note:** The `ss-migrate-idmap.json` file is useful for debugging. It shows which source IDs mapped to which target IDs for folders, policies, and secrets.
+
+---
+
+## Circular Dependency Handling
+
+When Error **E3006** (Circular RPC reference) is logged, the migration continues:
+
+1. Both secrets in the cycle are created (Pass 1)
+2. One RPC link is established successfully (e.g., A→B)
+3. The reverse link (B→A) is skipped with E3006 warning
+4. Migration proceeds to completion
+
+**After migration:** Manually configure the skipped RPC link in the target Secret Server web UI.
+
+This is rare but can occur when two service accounts authenticate each other (mutual authentication scenarios).
 
 ---
 

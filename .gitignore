@@ -1,5 +1,8 @@
 # Secret Server Migration Toolkit - Git Ignore
 
+# Development planning docs (local only)
+dev/
+
 # Export files contain secrets - NEVER commit these
 ss-export-*.json
 

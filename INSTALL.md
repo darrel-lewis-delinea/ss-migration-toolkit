@@ -94,11 +94,19 @@ Both source and target Secret Server instances must have:
 **On Source (read-only needed):**
 - View Secrets
 - List Secrets in folders being migrated
+- (Full Migration mode) View Folders, View Secret Policies
 
 **On Target (write needed):**
+
+*Secrets Only Mode:*
 - Create Secrets
 - View Secret Templates
 - Access to target folders
+
+*Full Migration Mode (additional):*
+- Create Folders
+- Create Secret Policies
+- Edit Folders (for policy assignment)
 
 ### TLS Requirements
 

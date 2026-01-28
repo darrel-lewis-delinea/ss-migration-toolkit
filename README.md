@@ -2,15 +2,112 @@
 
 Interactive wizard for migrating secrets between Secret Server instances using the REST API.
 
-**Version:** 2.2.5
+**Version:** 3.0.0
 **Author:** Delinea WW Architecture Team
 **Date:** January 2026
 
 ---
 
-## Why This Tool?
+## Important Disclaimer
 
-Unlike CSV import, this toolkit preserves all secret fields including expiration dates. The July 2025 Secret Server release optimized bulk operations for "tens of thousands of secrets" with 20% performance improvement. This toolkit leverages those improvements.
+> **This toolkit is NOT a replacement for Delinea Professional Services migration offerings.**
+>
+> This is a **lightweight, field-portable tool** designed for:
+> - **Proof of concept** migrations
+> - **Testing** migration workflows before engaging Professional Services
+> - **Small-scale** migrations (hundreds to low thousands of secrets)
+> - **SE demonstrations** of migration capabilities
+>
+> For production migrations, especially:
+> - Large scale (10,000+ secrets)
+> - Complex environments (multiple sites, custom workflows)
+> - Compliance-sensitive data
+> - Mission-critical systems
+>
+> **Contact Delinea Professional Services** for fully supported migration engagement.
+
+---
+
+## What's New in v3.0
+
+### Full Migration Mode
+Migrates the complete object graph, not just secrets:
+- **Folders** - Hierarchy preserved, created in correct order
+- **Secret Policies** - Checkout, expiration, and other policy settings
+- **Secrets** - With folder and policy assignments
+- **RPC/Privileged Account Links** - Two-pass migration handles dependencies
+
+### Pre-Flight Validation
+Catches problems before migration starts:
+- Site mapping validation
+- Template matching verification
+- Circular dependency detection
+- Blocking vs warning classification
+
+### Two-Pass Secret Migration
+Handles circular dependencies between secrets:
+1. **Pass 1**: Create all secrets without RPC links
+2. **Pass 2**: Link secrets to their privileged accounts
+
+---
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    SS-MIGRATE v3.0 FLOW                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐  │
+│  │  AUTH    │───▶│ VALIDATE │───▶│  EXPORT  │───▶│  IMPORT  │  │
+│  └──────────┘    └──────────┘    └──────────┘    └──────────┘  │
+│       │               │               │               │         │
+│       ▼               ▼               ▼               ▼         │
+│  Source/Target   Sites/Templates  Folders/Policies  Pass 1/2   │
+│  Credentials     Mapping Check    /Secrets          Creation   │
+│                                                                 │
+├─────────────────────────────────────────────────────────────────┤
+│  DEPENDENCY ORDER (Full Migration Mode):                        │
+│                                                                 │
+│  Sites ──▶ Templates ──▶ Folders ──▶ Policies ──▶ Secrets      │
+│    │           │            │           │            │          │
+│    │           │            │           │            ▼          │
+│    │           │            │           │      RPC Pass 2       │
+│    │           │            │           │      (link privd      │
+│    │           │            │           │       accounts)       │
+│    │           │            │           ▼                       │
+│    │           │            └────▶ Folder Policy                │
+│    │           │                   Assignment                   │
+│    │           ▼                                                │
+│    │      Template ID                                           │
+│    │      Mapping                                               │
+│    ▼                                                            │
+│  Site ID Mapping                                                │
+│  (read-only, no creation)                                       │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Circular Dependency Handling
+
+A circular dependency occurs when secrets reference each other as privileged accounts:
+
+```
+Secret A uses Secret B for RPC
+Secret B uses Secret A for RPC
+```
+
+This creates an A→B→A cycle that cannot be fully migrated because:
+- Secret A needs Secret B to exist first
+- Secret B needs Secret A to exist first
+
+**How ss-migrate handles this:**
+1. **Detection**: `Test-CircularRpcReferences` builds a dependency graph and detects cycles
+2. **Warning**: User is shown which secrets are affected
+3. **Graceful degradation**: Secrets are created without the circular RPC link
+4. **Manual fix**: Admin can configure RPC manually after migration
+
+Circular references are rare but can occur in complex environments with mutual authentication requirements.
 
 ---
 
@@ -40,10 +137,44 @@ pwsh ./ss-migrate.ps1
 The interactive wizard guides you through:
 1. **Connect** - Enter source and target URLs + credentials
 2. **Pre-flight** - Validates connectivity and permissions
-3. **Export** - Pulls all secrets from source
-4. **Dry Run** - Shows what would be imported (no changes)
-5. **Import** - Creates secrets on target (requires confirmation)
-6. **Validate** - Compares source and target
+3. **Migration Mode** - Choose Secrets Only or Full Migration
+4. **Validation** - (Full mode) Check site/template mappings
+5. **Export** - Pull objects from source
+6. **Dry Run** - Shows what would be imported (no changes)
+7. **Import** - Create objects on target (requires confirmation)
+8. **RPC Linking** - (if applicable) Link privileged accounts
+9. **Validate** - Compare source and target
+
+**If interrupted:** Resume from where you left off:
+```powershell
+pwsh ./ss-migrate.ps1 -Resume
+```
+
+---
+
+## Migration Modes
+
+### Secrets Only (Default)
+Migrates secrets into existing folder structure on target.
+
+Best for:
+- Target already has folders set up
+- Quick migrations
+- Testing
+
+### Full Migration (v3.0)
+Migrates complete object graph: folders, policies, and secrets.
+
+Best for:
+- Fresh target environment
+- Preserving folder hierarchy
+- Preserving policy assignments
+
+```
+Select migration mode:
+  [1] Secrets Only - Migrate secrets to existing folder structure (fastest)
+  [2] Full Migration - Migrate folders, policies, AND secrets (complete)
+```
 
 ---
 
@@ -55,6 +186,7 @@ The interactive wizard guides you through:
 - Progress bars with ETA
 
 **Safety First**
+- Pre-flight validation catches issues early
 - Mandatory dry-run before actual import
 - Explicit confirmation for destructive operations
 - Checkpoint-based resume if interrupted
@@ -62,68 +194,35 @@ The interactive wizard guides you through:
 **Full Field Preservation**
 - Secret expiration dates (unlike CSV import)
 - Custom fields
-- Folder structure
+- Folder structure and policies
+- RPC/privileged account links
 - Auto-change settings
 
 **Security**
 - Credentials use SecureString
 - Never logged to disk
 - Cleared from memory after use
+- TLS 1.2+ enforced
+- **Token expiry tracking** - Prompts for re-auth before long operations if token expired
 
 ---
 
-## Usage Modes
+## Error Codes
 
-### Full Migration (Guided)
+The toolkit uses structured error codes for easier troubleshooting:
 
-```powershell
-pwsh ./ss-migrate.ps1
-# Select option 1: "Full Migration"
-```
+| Code | Severity | Description |
+|------|----------|-------------|
+| E1001 | FATAL | Authentication failed |
+| E1002 | FATAL | Network unreachable |
+| E2001 | BLOCKING | Site not found on target |
+| E2002 | BLOCKING | Template not found on target |
+| E2006 | BLOCKING | Insufficient permissions |
+| E3005 | RECOVERABLE | Privileged account not found |
+| E3006 | RECOVERABLE | Circular RPC reference |
+| E4002 | WARNING | Duplicate name on target |
 
-### Export Only
-
-```powershell
-pwsh ./ss-migrate.ps1
-# Select option 2: "Export only"
-```
-
-Useful for:
-- Creating backups
-- Preparing for later migration
-- Auditing secret inventory
-
-### Import from File
-
-```powershell
-pwsh ./ss-migrate.ps1
-# Select option 3: "Import from file"
-```
-
-Use a previously created export file.
-
-### Validate Existing Migration
-
-```powershell
-pwsh ./ss-migrate.ps1
-# Select option 4: "Validate existing migration"
-```
-
-Compare source and target after migration.
-
-### Resume Interrupted Migration
-
-```powershell
-pwsh ./ss-migrate.ps1 -Resume
-```
-
-Continues from the last checkpoint.
-
-### Show Help
-
-```powershell
-pwsh ./ss-migrate.ps1 -Help
-```
+See `TROUBLESHOOTING.md` for resolution steps.
 
 ---
 
@@ -141,14 +240,6 @@ Default settings (edit in script if needed):
 | ValidationSamplePercent | 5 | % of secrets to spot-check |
 | DuplicateNamePolicy | TrustTarget | How to handle duplicate names |
 
-### For Large Migrations (40K+ secrets)
-
-```powershell
-# Edit these in ss-migrate.ps1 for faster migration:
-$script:Config.BatchSize = 1000
-$script:Config.ThrottleDelayMs = 50
-```
-
 ---
 
 ## Prerequisites
@@ -164,22 +255,8 @@ $script:Config.ThrottleDelayMs = 50
 ### On Secret Server (Target)
 - Web Services enabled
 - User account with Create Secret permission
+- (Full mode) Create Folder and Create Policy permissions
 - "Allow Duplicate Secret Names" enabled (if source has duplicates)
-
-See `INSTALL.md` for detailed setup instructions.
-
-### Duplicate Name Handling
-
-The wizard prompts for a duplicate name policy:
-
-| Policy | Use Case | Speed |
-|--------|----------|-------|
-| **Trust Target** | Bulk imports, empty target, SS allows duplicates | Fastest |
-| Fail | Strict control, stop on any duplicate | Slower |
-| Skip | Incremental sync, only import new secrets | Slower |
-| Rename | Add suffix to duplicates | Slower |
-
-**For bulk migrations (like 40K+ secrets): Use "Trust Target"** - it skips duplicate analysis entirely and lets Secret Server handle naming per its configuration.
 
 ---
 
@@ -190,7 +267,8 @@ The wizard prompts for a duplicate name policy:
 | `ss-migrate-*.log` | Operation log | No (names only) |
 | `ss-export-*.json` | Exported secrets | **YES - secure/delete after!** |
 | `ss-migrate-checkpoint.json` | Resume state | No |
-| `ss-migrate-failures.json` | Failed secrets for retry | No (IDs/names only) |
+| `ss-migrate-failures.json` | Failed items for retry | No (IDs/names only) |
+| `ss-migrate-idmap.json` | ID mapping export (debug) | No |
 
 ---
 
@@ -200,14 +278,17 @@ The wizard prompts for a duplicate name policy:
 2. **Export file contains secrets** - Delete or encrypt after migration
 3. **Use dedicated service account** - Don't use your personal admin account
 4. **Run from secure machine** - Export file will be stored locally
+5. **TLS 1.2+ required** - Connections to Secret Server are encrypted
 
 ---
 
 ## Troubleshooting
 
 See `TROUBLESHOOTING.md` for common issues:
-- Authentication failures
-- Permission errors
+- Authentication failures (E1001)
+- Permission errors (E2006)
+- Missing templates/sites (E2001, E2002)
+- Circular dependencies (E3006)
 - Timeout/performance issues
 - Resume procedures
 
@@ -225,184 +306,52 @@ See `TROUBLESHOOTING.md` for common issues:
 
 ---
 
-## Example Session
+## Design Principles
 
-```
-  ╔═══════════════════════════════════════════════════════════════╗
-  ║   SECRET SERVER MIGRATION TOOLKIT                             ║
-  ║   Version 2.2.4                                               ║
-  ╚═══════════════════════════════════════════════════════════════╝
+This toolkit is designed for **SE field portability**:
 
-What would you like to do?
---------------------------
-  [1] Full Migration (guided wizard)
-  [2] Export only (save secrets to file)
-  [3] Import from file (use existing export)
-  [4] Validate existing migration
-  [5] Exit
-
-Select option (1-5): 1
-
-═══════════════════════════════════════════════════════════════
-                    FULL MIGRATION WIZARD
-═══════════════════════════════════════════════════════════════
-
-STEP 1: Connection Information
-------------------------------
-
-SOURCE Secret Server (where secrets are now):
-Source URL: https://company.secretservercloud.com
-Source username: api-migration
-Source password: ********
-
-TARGET Secret Server (where secrets will go):
-Target URL: https://company-platform.secretservercloud.com
-Target username: api-migration
-Target password: ********
-
-STEP 2: Pre-flight Checks
--------------------------
-
-Authenticating to source...
-[SUCCESS] Source authentication successful
-Authenticating to target...
-[SUCCESS] Target authentication successful
-Checking source permissions...
-  Can list secrets: True
-  Can read secrets: True
-  Secret count: 40,000
-Checking target permissions...
-  Can create secrets: True
-[SUCCESS] Pre-flight checks passed!
-
-STEP 3: Export Secrets
-----------------------
-
-Ready to export 40,000 secrets from source? [Y/n]: y
-
-  [████████████████████░░░░] 85% (34,000/40,000)
-
-[SUCCESS] Exported 40,000 secrets to ./ss-export-2026-01-27.json
-[WARNING] Export file contains secrets in clear text. Secure or delete after migration.
-
-STEP 4: Dry Run
----------------
-
-Performing dry run (no changes will be made)...
-  [████████████████████████] 100% (40,000/40,000)
-
-DRY RUN Complete
-  Success: 40,000
-  Failed:  0
-
-Dry run summary:
-  Would create: 40,000 secrets
-  Would fail:   0 secrets
-
-STEP 5: Import Secrets
-----------------------
-
-╔════════════════════════════════════════════════════════════╗
-║  WARNING: This will create secrets on the target system!   ║
-╚════════════════════════════════════════════════════════════╝
-
-Proceed with import? [y/N]: y
-
-  [████████████████████████] 100% (40,000/40,000)
-
-IMPORT Complete
-  Success: 40,000
-  Failed:  0
-
-STEP 6: Validation
-------------------
-
-Validating migration...
-Source count: 40,000
-Target count: 40,000
-[SUCCESS] Counts match
-Spot-checking 2,000 random secrets...
-[SUCCESS] Spot check: 2,000/2,000 secrets verified
-
-═══════════════════════════════════════════════════════════════
-                    MIGRATION COMPLETE
-═══════════════════════════════════════════════════════════════
-
-Results:
-  Exported:    40,000
-  Imported:    40,000
-  Failed:      0
-  Validated:   2,000/2,000 spot checks passed
-
-Files:
-  Log:         ./ss-migrate-2026-01-27-153000.log
-  Export:      ./ss-export-2026-01-27.json
-
-[SUCCESS] Migration completed successfully!
-
-REMINDER: Delete or secure the export file - it contains secrets in clear text.
-```
+1. **Single file** - Copy one `.ps1` file, run anywhere
+2. **No external dependencies** - Pure PowerShell 7, no pip/npm/binaries
+3. **Interactive wizard** - Run without reading docs first
+4. **Offline capable** - Export file can be carried to air-gapped networks
+5. **Idempotent** - Re-running doesn't create duplicates
 
 ---
 
 ## Changelog
 
+### v3.0.0 (January 2026)
+**Full Migration Mode Release**
+
+- **Full Migration**: Migrate folders, policies, and secrets together
+- **Pre-Flight Validation**: Catch site/template mismatches before migration
+- **Two-Pass Secret Migration**: Handle RPC/privileged account dependencies
+- **Circular Dependency Detection**: Identify and gracefully handle A→B→A cycles
+- **ID Mapping Infrastructure**: Track source→target IDs across all object types
+- **Structured Error Codes**: E1xxx (fatal), E2xxx (blocking), E3xxx (recoverable), E4xxx (warning)
+- **Checkpoint v3.0**: Persist ID mappings and correlation IDs for resume
+- **51 Unit Tests**: Comprehensive test coverage for new features
+
 ### v2.2.5 (January 2026)
-- **Bugfix**: Fixed menu index off-by-one error in duplicate policy selection (Show-Menu returns 0-indexed)
-- **Bugfix**: Fixed version mismatch between .NOTES header and Config
+- Bugfix: Fixed menu index off-by-one error in duplicate policy selection
 
 ### v2.2.4 (January 2026)
-- **UX**: URL validation now offers retry instead of exiting on invalid input
-- **UX**: Auto-suggests `https://` prefix when missing (prompts user to confirm)
-- **UX**: Added example URL format to target prompt for consistency
+- UX: URL validation with retry and auto-suggest https://
 
 ### v2.2.3 (January 2026)
-- **Security**: Added `ZeroFreeBSTR` to securely clear password from unmanaged memory after OAuth
-- **Security**: Proper BSTR pointer cleanup in `Read-SecurePrompt` and `Get-SSToken`
-
-### v2.2.2 (January 2026)
-- **Bugfix**: Added missing `-ContentType "application/x-www-form-urlencoded"` to OAuth token request
-
-### v2.2.1 (January 2026)
-- **Bugfix**: Fixed `$Activity:` variable parsing error on line 310 (PowerShell interpreted colon as scope modifier)
+- Security: SecureString cleanup with ZeroFreeBSTR
 
 ### v2.2.0 (January 2026)
-**Robustness & Debuggability Release**
-
-- **Rate limit handling**: Max 10 retries for 429 errors with exponential backoff (prevents infinite loops)
-- **Network error handling**: Safe status code extraction for connection failures
-- **Performance**: ArrayList.Add() instead of array += for O(1) vs O(n²) append operations
-- **Progress display**: ETA calculation and completion time ("Completed in Xh Xm")
-- **Failure persistence**: Failed secrets saved to `ss-migrate-failures.json` for retry
-- **Error messages**: Include endpoint name and status code for easier debugging
-- **Export resilience**: Continues on single secret failure instead of stopping
+- Rate limit handling with exponential backoff
+- Performance: ArrayList for O(1) append
+- Failure persistence for retry
 
 ### v2.1.0 (January 2026)
-**Duplicate Name Handling Release**
-
-- **TrustTarget policy**: Skip all duplicate checking for bulk imports (default)
-- **Duplicate policies**: Fail, Skip, Rename options for stricter control
-- **Wizard prompt**: Interactive duplicate policy selection
-- **Duplicate analysis**: Pre-import analysis showing potential conflicts
-- **Pure PowerShell tests**: `Test-SSMigrate.ps1` with no external dependencies
+- Duplicate name handling policies
+- TrustTarget mode for bulk imports
 
 ### v2.0.0 (January 2026)
-**Initial Release**
-
-- Interactive wizard for guided migrations
-- Full field preservation (expiration dates, custom fields, folder structure)
-- Mandatory dry-run before import
-- Checkpoint-based resume for interrupted migrations
-- SecureString credential handling
-- Validation with spot-checking
-
----
-
-## Roadmap
-
-### Planned Enhancements
-
-- [ ] **Secret Generator Tool** - Secondary script to generate test secrets for populating a source tenant (useful for testing migrations at scale)
+- Initial release with interactive wizard
 
 ---
 
@@ -410,6 +359,8 @@ REMINDER: Delete or secure the export file - it contains secrets in clear text.
 
 This toolkit is provided by the Delinea WW Architecture Team for internal use and customer assistance.
 
-**Note:** Per Delinea documentation, "Migration is not supported by Delinea Technical Support." This toolkit uses the documented REST API and is designed for self-service migrations.
+**Important:** This is a field tool for testing and proof of concept. For production migrations, contact **Delinea Professional Services**.
+
+Per Delinea documentation: "Migration is not supported by Delinea Technical Support." This toolkit uses the documented REST API and is designed for self-service migrations.
 
 For questions or issues, contact the WW Architecture Team.

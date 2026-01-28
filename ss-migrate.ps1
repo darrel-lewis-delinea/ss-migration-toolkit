@@ -16,9 +16,16 @@
     ./ss-migrate.ps1 -Help
     Shows detailed help
 .NOTES
-    Version: 2.2.5
+    Version: 3.0.0-alpha
     Author: Delinea WW Architecture Team
     Requires: PowerShell 7+, TLS 1.2/1.3
+
+    v3.0.0 - Policy-Aware Migration
+    - Pre-flight validation (sites, templates)
+    - ID mapping infrastructure for multi-pass migration
+    - Checkpoint schema v3.0 with ID mappings
+    - Correlation IDs for log tracing
+    - Foundation for folder/policy/RPC migration
 #>
 
 [CmdletBinding()]
@@ -31,7 +38,7 @@ param(
 
 #region Configuration
 $script:Config = @{
-    Version = "2.2.5"
+    Version = "3.0.0-alpha"
     BatchSize = 500
     ThrottleDelayMs = 200  # Conservative default for large migrations; increase if hitting rate limits
     ConnectionTimeoutSec = 30
@@ -64,10 +71,93 @@ $script:State = @{
     FailedSecrets = @()
     CurrentPhase = "Init"
     LastBatchIndex = 0
+    # Token management for long-running migrations
+    SourceTokenExpiry = $null
+    TargetTokenExpiry = $null
 }
+
+# ID Mapping for policy-aware migration (v3.0)
+# Maps source IDs to target IDs for each object type
+$script:IdMap = @{
+    Sites = @{}           # SourceSiteId → TargetSiteId
+    Templates = @{}       # SourceTemplateId → TargetTemplateId
+    Folders = @{}         # SourceFolderId → TargetFolderId
+    Policies = @{}        # SourcePolicyId → TargetPolicyId
+    Secrets = @{}         # SourceSecretId → TargetSecretId
+}
+
+# Validation results for pre-flight checks
+$script:ValidationReport = @{
+    Sites = @{ Mapped = @(); Unmapped = @(); AffectedSecrets = @() }
+    Templates = @{ Mapped = @(); Unmapped = @(); FieldMismatches = @() }
+    Policies = @{ Conflicts = @(); Resolution = @() }
+    Folders = @{ Conflicts = @(); Resolution = @() }
+    CircularRefs = @{ Cycles = @(); AffectedSecrets = @() }
+    Blocking = @()    # Issues that must be resolved
+    Warnings = @()    # Issues that can be bypassed
+}
+
+# Migration mode: SecretsOnly (default), Full, FolderScope
+$script:MigrationMode = "SecretsOnly"
+
+# Correlation ID for tracing operations across logs
+$script:CorrelationId = [guid]::NewGuid().ToString().Substring(0, 8)
 
 # Force TLS 1.2+
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# Error codes for structured error handling (v3.0)
+# See TROUBLESHOOTING.md for resolution steps
+$script:ErrorCodes = @{
+    # FATAL (1xxx) - Immediate stop
+    E1001 = "Authentication failed"
+    E1002 = "Network unreachable"
+    E1003 = "Invalid configuration"
+    E1004 = "Incompatible API version"
+
+    # BLOCKING (2xxx) - Stop phase, prompt user
+    E2001 = "Site not found on target"
+    E2002 = "Template not found on target"
+    E2003 = "Folder path conflict"
+    E2004 = "Policy name conflict"
+    E2005 = "Required field missing"
+    E2006 = "Insufficient permissions"
+
+    # RECOVERABLE (3xxx) - Log, skip item, continue
+    E3001 = "Template field mismatch"
+    E3002 = "Folder not found for secret"
+    E3003 = "Rate limit exceeded (retrying)"
+    E3004 = "Single item API failure"
+    E3005 = "Privileged account not found"
+    E3006 = "Circular RPC reference"
+
+    # WARNING (4xxx) - Log, continue
+    E4001 = "Field value truncated"
+    E4002 = "Duplicate name on target"
+    E4003 = "Empty folder skipped"
+    E4004 = "RPC config not migrated"
+}
+
+function Get-ErrorMessage {
+    <#
+    .SYNOPSIS
+        Get formatted error message with code and resolution hint
+    #>
+    param(
+        [string]$Code,
+        [string]$Details = "",
+        [string]$Resolution = ""
+    )
+
+    $baseMsg = $script:ErrorCodes[$Code]
+    if (-not $baseMsg) { $baseMsg = "Unknown error" }
+
+    $msg = "[$Code] $baseMsg"
+    if ($Details) { $msg += ": $Details" }
+    if ($Resolution) { $msg += " → $Resolution" }
+
+    return $msg
+}
 #endregion
 
 #region Logging
@@ -466,6 +556,14 @@ function Invoke-SSApi {
 }
 
 function Get-SSToken {
+    <#
+    .SYNOPSIS
+    Authenticates to Secret Server and returns token with expiry info.
+
+    .DESCRIPTION
+    Returns a hashtable with 'Token' and 'Expiry' (DateTime when token expires).
+    Token typically expires in 1 hour - critical for long-running migrations.
+    #>
     param(
         [string]$BaseUrl,
         [string]$Username,
@@ -490,7 +588,16 @@ function Get-SSToken {
         Write-Log "Authenticating to $BaseUrl..." -Level Info
         $response = Invoke-RestMethod -Uri "$BaseUrl/oauth2/token" -Method Post -Body $body -ContentType "application/x-www-form-urlencoded" -TimeoutSec $script:Config.ConnectionTimeoutSec
 
-        return $response.access_token
+        # Calculate token expiry (default 1 hour if not specified, with 5 minute buffer)
+        $expiresIn = if ($response.expires_in) { $response.expires_in - 300 } else { 3300 }  # 55 minutes default
+        $expiry = (Get-Date).AddSeconds($expiresIn)
+
+        Write-Log "Token expires at $($expiry.ToString('HH:mm:ss')) (in $([math]::Round($expiresIn / 60)) minutes)" -Level Debug
+
+        return @{
+            Token = $response.access_token
+            Expiry = $expiry
+        }
     }
     catch {
         # Sanitize URL in error message (remove any embedded credentials)
@@ -506,13 +613,126 @@ function Get-SSToken {
         $plainPassword = $null
     }
 }
+
+function Test-TokenExpired {
+    <#
+    .SYNOPSIS
+    Checks if a token is expired or about to expire.
+    #>
+    param(
+        [DateTime]$Expiry
+    )
+
+    if ($null -eq $Expiry) { return $false }  # No expiry tracking, assume valid
+    return (Get-Date) -gt $Expiry
+}
+
+function Request-TokenRefresh {
+    <#
+    .SYNOPSIS
+    Prompts user to re-authenticate if token is expired.
+
+    .DESCRIPTION
+    Called before major phases. If token expired, prompts for re-auth.
+    Returns $true if tokens are valid (or refreshed), $false if user declines.
+    #>
+    param(
+        [string]$Phase = "continue"
+    )
+
+    $sourceExpired = Test-TokenExpired -Expiry $script:State.SourceTokenExpiry
+    $targetExpired = Test-TokenExpired -Expiry $script:State.TargetTokenExpiry
+
+    if (-not $sourceExpired -and -not $targetExpired) {
+        return $true  # Tokens still valid
+    }
+
+    Write-Host ""
+    Write-Host "╔═══════════════════════════════════════════════════════════════╗" -ForegroundColor Yellow
+    Write-Host "║  TOKEN REFRESH REQUIRED                                       ║" -ForegroundColor Yellow
+    Write-Host "╚═══════════════════════════════════════════════════════════════╝" -ForegroundColor Yellow
+    Write-Host ""
+
+    if ($sourceExpired) {
+        Write-Host "  Source token has expired." -ForegroundColor Yellow
+    }
+    if ($targetExpired) {
+        Write-Host "  Target token has expired." -ForegroundColor Yellow
+    }
+    Write-Host ""
+    Write-Host "  Re-authentication is required to $Phase." -ForegroundColor White
+    Write-Host ""
+
+    if (-not (Read-Confirmation "Re-authenticate now?")) {
+        Write-Log "User declined re-authentication" -Level Warning
+        return $false
+    }
+
+    # Re-authenticate to source if expired
+    if ($sourceExpired) {
+        Write-Host "`nSource Secret Server credentials:" -ForegroundColor Cyan
+        $sourceUser = Read-Prompt -Prompt "Username"
+        $sourcePass = Read-SecurePrompt -Prompt "Password"
+
+        try {
+            $authResult = Get-SSToken -BaseUrl $script:State.SourceUrl -Username $sourceUser -Password $sourcePass
+            $script:State.SourceToken = $authResult.Token
+            $script:State.SourceTokenExpiry = $authResult.Expiry
+            Write-Log "Source re-authentication successful" -Level Success
+        }
+        catch {
+            Write-Log "Source re-authentication failed: $_" -Level Error
+            return $false
+        }
+        finally {
+            $sourcePass = $null
+            [GC]::Collect()
+        }
+    }
+
+    # Re-authenticate to target if expired
+    if ($targetExpired) {
+        Write-Host "`nTarget Secret Server credentials:" -ForegroundColor Cyan
+        $targetUser = Read-Prompt -Prompt "Username"
+        $targetPass = Read-SecurePrompt -Prompt "Password"
+
+        try {
+            $authResult = Get-SSToken -BaseUrl $script:State.TargetUrl -Username $targetUser -Password $targetPass
+            $script:State.TargetToken = $authResult.Token
+            $script:State.TargetTokenExpiry = $authResult.Expiry
+            Write-Log "Target re-authentication successful" -Level Success
+        }
+        catch {
+            Write-Log "Target re-authentication failed: $_" -Level Error
+            return $false
+        }
+        finally {
+            $targetPass = $null
+            [GC]::Collect()
+        }
+    }
+
+    return $true
+}
 #endregion
 
 #region Checkpoint Management
 function Save-Checkpoint {
+    # Convert integer keys to strings for JSON compatibility
+    $idMapsForJson = @{}
+    foreach ($type in @('Sites', 'Templates', 'Folders', 'Policies', 'Secrets')) {
+        $idMapsForJson[$type] = @{}
+        foreach ($key in $script:IdMap[$type].Keys) {
+            $idMapsForJson[$type]["$key"] = $script:IdMap[$type][$key]
+        }
+    }
+
     $checkpoint = @{
         Timestamp = Get-Date -Format "o"
+        Version = "3.0"  # Checkpoint schema version for compatibility
+        CorrelationId = $script:CorrelationId
         Phase = $script:State.CurrentPhase
+        MigrationMode = $script:MigrationMode
         SourceUrl = $script:State.SourceUrl
         TargetUrl = $script:State.TargetUrl
         ExportFile = $script:Config.ExportFile
@@ -520,10 +740,12 @@ function Save-Checkpoint {
         ImportedCount = $script:State.ImportedSecrets.Count
         FailedCount = $script:State.FailedSecrets.Count
         ImportedIds = $script:State.ImportedSecrets | Select-Object -ExpandProperty TargetId -ErrorAction SilentlyContinue
+        # v3.0: Include ID mappings for policy-aware migration
+        IdMaps = $idMapsForJson
     }
 
     $checkpoint | ConvertTo-Json -Depth 10 | Out-File $script:Config.CheckpointFile -Encoding UTF8
-    Write-Log "Checkpoint saved" -Level Debug
+    Write-Log "[$script:CorrelationId] Checkpoint saved (Phase: $($script:State.CurrentPhase))" -Level Debug
 }
 
 function Restore-Checkpoint {
@@ -532,7 +754,21 @@ function Restore-Checkpoint {
     }
 
     try {
-        $checkpoint = Get-Content $script:Config.CheckpointFile | ConvertFrom-Json
+        # Validate checkpoint file size (security check)
+        $fileSize = (Get-Item $script:Config.CheckpointFile).Length
+        if ($fileSize -gt 100MB) {
+            Write-Log "Checkpoint file suspiciously large ($($fileSize / 1MB) MB). Ignoring." -Level Warning
+            return $false
+        }
+
+        $checkpoint = Get-Content $script:Config.CheckpointFile -Raw | ConvertFrom-Json
+
+        # Validate checkpoint structure (prevent injection)
+        $validPhases = @('Init', 'Connect', 'Preflight', 'Validation', 'Export', 'DryRun', 'Import', 'SecretsPass1', 'SecretsPass2', 'FoldersPass1', 'FoldersPass2', 'Policies', 'Validate', 'Complete')
+        if ($checkpoint.Phase -and $checkpoint.Phase -notin $validPhases) {
+            Write-Log "Invalid checkpoint phase: $($checkpoint.Phase). Ignoring." -Level Warning
+            return $false
+        }
 
         Write-Log "Found checkpoint from $($checkpoint.Timestamp)" -Level Info
         Write-Log "  Phase: $($checkpoint.Phase)" -Level Info
@@ -540,12 +776,57 @@ function Restore-Checkpoint {
         Write-Log "  Target: $($checkpoint.TargetUrl)" -Level Info
         Write-Log "  Progress: $($checkpoint.ImportedCount) imported, $($checkpoint.FailedCount) failed" -Level Info
 
+        # v3.0: Show ID mapping summary if present
+        if ($checkpoint.IdMaps) {
+            $mapCounts = @()
+            foreach ($type in @('Sites', 'Templates', 'Folders', 'Policies', 'Secrets')) {
+                $count = 0
+                if ($checkpoint.IdMaps.$type) {
+                    # Handle both hashtable and PSCustomObject from JSON
+                    $count = ($checkpoint.IdMaps.$type.PSObject.Properties | Measure-Object).Count
+                }
+                if ($count -gt 0) { $mapCounts += "$type`:$count" }
+            }
+            if ($mapCounts.Count -gt 0) {
+                Write-Log "  ID Mappings: $($mapCounts -join ', ')" -Level Info
+            }
+        }
+
+        if ($checkpoint.MigrationMode) {
+            Write-Log "  Mode: $($checkpoint.MigrationMode)" -Level Info
+        }
+
         if (Read-Confirmation "Resume from this checkpoint?") {
             $script:State.SourceUrl = $checkpoint.SourceUrl
             $script:State.TargetUrl = $checkpoint.TargetUrl
             $script:State.CurrentPhase = $checkpoint.Phase
             $script:State.LastBatchIndex = $checkpoint.LastBatchIndex
             $script:Config.ExportFile = $checkpoint.ExportFile
+
+            # v3.0: Restore correlation ID if present
+            if ($checkpoint.CorrelationId) {
+                $script:CorrelationId = $checkpoint.CorrelationId
+            }
+
+            # v3.0: Restore migration mode if present
+            if ($checkpoint.MigrationMode) {
+                $script:MigrationMode = $checkpoint.MigrationMode
+            }
+
+            # v3.0: Restore ID mappings if present
+            if ($checkpoint.IdMaps) {
+                # Convert PSCustomObject properties back to hashtables
+                foreach ($type in @('Sites', 'Templates', 'Folders', 'Policies', 'Secrets')) {
+                    if ($checkpoint.IdMaps.$type) {
+                        $script:IdMap[$type] = @{}
+                        foreach ($prop in $checkpoint.IdMaps.$type.PSObject.Properties) {
+                            $script:IdMap[$type][[int]$prop.Name] = [int]$prop.Value
+                        }
+                    }
+                }
+                Write-Log "Restored ID mappings from checkpoint" -Level Debug
+            }
+
             return $true
         }
     }
@@ -562,6 +843,132 @@ function Clear-Checkpoint {
         Write-Log "Checkpoint cleared" -Level Debug
     }
 }
+#endregion
+
+#region ID Mapping (v3.0 - Policy-Aware Migration)
+
+function Set-IdMapping {
+    <#
+    .SYNOPSIS
+        Store a source-to-target ID mapping
+    .PARAMETER ObjectType
+        Type of object: Sites, Templates, Folders, Policies, Secrets
+    .PARAMETER SourceId
+        ID from the source Secret Server
+    .PARAMETER TargetId
+        ID from the target Secret Server
+    .PARAMETER Name
+        Optional name for debugging
+    #>
+    param(
+        [ValidateSet('Sites', 'Templates', 'Folders', 'Policies', 'Secrets')]
+        [string]$ObjectType,
+        [int]$SourceId,
+        [int]$TargetId,
+        [string]$Name = ""
+    )
+
+    $script:IdMap[$ObjectType][$SourceId] = $TargetId
+    Write-Log "[$script:CorrelationId] Mapped $ObjectType : $SourceId -> $TargetId $(if ($Name) { "($Name)" })" -Level Debug
+}
+
+function Get-MappedId {
+    <#
+    .SYNOPSIS
+        Get the target ID for a source ID
+    .PARAMETER ObjectType
+        Type of object: Sites, Templates, Folders, Policies, Secrets
+    .PARAMETER SourceId
+        ID from the source Secret Server
+    .RETURNS
+        Target ID if mapped, $null if not found
+    #>
+    param(
+        [ValidateSet('Sites', 'Templates', 'Folders', 'Policies', 'Secrets')]
+        [string]$ObjectType,
+        [int]$SourceId
+    )
+
+    if ($script:IdMap[$ObjectType].ContainsKey($SourceId)) {
+        return $script:IdMap[$ObjectType][$SourceId]
+    }
+
+    Write-Log "[$script:CorrelationId] WARNING: No mapping found for $ObjectType ID $SourceId" -Level Debug
+    return $null
+}
+
+function Test-IdMapping {
+    <#
+    .SYNOPSIS
+        Check if a source ID has been mapped
+    #>
+    param(
+        [ValidateSet('Sites', 'Templates', 'Folders', 'Policies', 'Secrets')]
+        [string]$ObjectType,
+        [int]$SourceId
+    )
+
+    return $script:IdMap[$ObjectType].ContainsKey($SourceId)
+}
+
+function Get-IdMapSummary {
+    <#
+    .SYNOPSIS
+        Get a summary of all ID mappings for display
+    #>
+    $summary = @()
+    foreach ($type in @('Sites', 'Templates', 'Folders', 'Policies', 'Secrets')) {
+        $count = $script:IdMap[$type].Count
+        if ($count -gt 0) {
+            $summary += "$type : $count"
+        }
+    }
+    return $summary -join ", "
+}
+
+function Export-IdMap {
+    <#
+    .SYNOPSIS
+        Export ID mappings to a JSON file for debugging/audit
+    #>
+    param([string]$Path = "./ss-migrate-idmap.json")
+
+    # Convert integer keys to strings for JSON compatibility
+    $mappingsForJson = @{}
+    foreach ($type in @('Sites', 'Templates', 'Folders', 'Policies', 'Secrets')) {
+        $mappingsForJson[$type] = @{}
+        foreach ($key in $script:IdMap[$type].Keys) {
+            $mappingsForJson[$type]["$key"] = $script:IdMap[$type][$key]
+        }
+    }
+
+    $export = @{
+        Timestamp = Get-Date -Format "o"
+        CorrelationId = $script:CorrelationId
+        SourceUrl = $script:State.SourceUrl
+        TargetUrl = $script:State.TargetUrl
+        Mappings = $mappingsForJson
+    }
+
+    $export | ConvertTo-Json -Depth 10 | Out-File $Path -Encoding UTF8
+    Write-Log "ID mappings exported to $Path" -Level Info
+}
+
+function Clear-IdMaps {
+    <#
+    .SYNOPSIS
+        Clear all ID mappings (for fresh migration)
+    #>
+    $script:IdMap = @{
+        Sites = @{}
+        Templates = @{}
+        Folders = @{}
+        Policies = @{}
+        Secrets = @{}
+    }
+    Write-Log "ID mappings cleared" -Level Debug
+}
+
 #endregion
 
 #region Validation Functions
@@ -686,6 +1093,400 @@ function Test-Permissions {
 
     return $results
 }
+#endregion
+
+#region Pre-Flight Validation (v3.0 - Policy-Aware Migration)
+
+function Get-SitesFromServer {
+    <#
+    .SYNOPSIS
+        Fetch all sites from a Secret Server instance
+    #>
+    param(
+        [string]$BaseUrl,
+        [string]$Token
+    )
+
+    try {
+        $response = Invoke-SSApi -BaseUrl $BaseUrl -Endpoint "sites" -Token $Token
+        if ($response.records) {
+            return $response.records
+        }
+        return @()
+    }
+    catch {
+        Write-Log "[$script:CorrelationId] Could not fetch sites: $_" -Level Warning
+        return @()
+    }
+}
+
+function Test-SiteMapping {
+    <#
+    .SYNOPSIS
+        Validate that all sites used by source secrets exist on target
+    .DESCRIPTION
+        Maps source sites to target sites by name. Returns report of:
+        - Mapped sites (name match found)
+        - Unmapped sites (no match on target)
+        - Affected secrets (secrets using unmapped sites)
+    #>
+    param(
+        [string]$SourceUrl,
+        [string]$SourceToken,
+        [string]$TargetUrl,
+        [string]$TargetToken,
+        [array]$SourceSecrets = @()
+    )
+
+    Write-Log "[$script:CorrelationId] Validating site mappings..." -Level Info
+
+    $result = @{
+        Mapped = @()
+        Unmapped = @()
+        AffectedSecrets = @()
+        SourceSites = @()
+        TargetSites = @()
+    }
+
+    # Get sites from both servers
+    $sourceSites = Get-SitesFromServer -BaseUrl $SourceUrl -Token $SourceToken
+    $targetSites = Get-SitesFromServer -BaseUrl $TargetUrl -Token $TargetToken
+    $result.SourceSites = $sourceSites
+    $result.TargetSites = $targetSites
+
+    # Build target site lookup by name (case-insensitive)
+    $targetSiteByName = @{}
+    foreach ($site in $targetSites) {
+        $targetSiteByName[$site.siteName.ToLower()] = $site
+    }
+
+    # Map source sites to target
+    foreach ($site in $sourceSites) {
+        $targetMatch = $targetSiteByName[$site.siteName.ToLower()]
+        if ($targetMatch) {
+            Set-IdMapping -ObjectType 'Sites' -SourceId $site.siteId -TargetId $targetMatch.siteId -Name $site.siteName
+            $result.Mapped += @{
+                SourceId = $site.siteId
+                TargetId = $targetMatch.siteId
+                Name = $site.siteName
+            }
+        }
+        else {
+            $result.Unmapped += @{
+                SourceId = $site.siteId
+                Name = $site.siteName
+            }
+        }
+    }
+
+    # Find secrets using unmapped sites
+    if ($result.Unmapped.Count -gt 0 -and $SourceSecrets.Count -gt 0) {
+        $unmappedIds = $result.Unmapped | ForEach-Object { $_.SourceId }
+        foreach ($secret in $SourceSecrets) {
+            if ($secret.siteId -and $secret.siteId -in $unmappedIds) {
+                $result.AffectedSecrets += @{
+                    SecretId = $secret.id
+                    SecretName = $secret.name
+                    SiteId = $secret.siteId
+                }
+            }
+        }
+    }
+
+    # Update validation report
+    $script:ValidationReport.Sites = $result
+
+    if ($result.Unmapped.Count -gt 0) {
+        $msg = "Site mapping: $($result.Mapped.Count) mapped, $($result.Unmapped.Count) UNMAPPED"
+        if ($result.AffectedSecrets.Count -gt 0) {
+            $msg += " ($($result.AffectedSecrets.Count) secrets affected)"
+        }
+        Write-Log "[$script:CorrelationId] $msg" -Level Warning
+    }
+    else {
+        Write-Log "[$script:CorrelationId] Site mapping: $($result.Mapped.Count) sites mapped successfully" -Level Success
+    }
+
+    return $result
+}
+
+function Get-SecretTemplatesFromServer {
+    <#
+    .SYNOPSIS
+        Fetch all secret templates from a Secret Server instance
+    #>
+    param(
+        [string]$BaseUrl,
+        [string]$Token
+    )
+
+    try {
+        $response = Invoke-SSApi -BaseUrl $BaseUrl -Endpoint "secret-templates?take=1000" -Token $Token
+        if ($response.records) {
+            return $response.records
+        }
+        return @()
+    }
+    catch {
+        Write-Log "[$script:CorrelationId] Could not fetch templates: $_" -Level Warning
+        return @()
+    }
+}
+
+function Get-TemplateFields {
+    <#
+    .SYNOPSIS
+        Get field definitions for a specific template
+    #>
+    param(
+        [string]$BaseUrl,
+        [string]$Token,
+        [int]$TemplateId
+    )
+
+    try {
+        $template = Invoke-SSApi -BaseUrl $BaseUrl -Endpoint "secret-templates/$TemplateId" -Token $Token
+        if ($template.fields) {
+            return $template.fields
+        }
+        return @()
+    }
+    catch {
+        Write-Log "[$script:CorrelationId] Could not fetch template fields for ID $TemplateId : $_" -Level Debug
+        return @()
+    }
+}
+
+function Test-TemplateMapping {
+    <#
+    .SYNOPSIS
+        Validate that all templates used by source secrets exist on target
+    .DESCRIPTION
+        Maps source templates to target templates by name. Also compares field structures
+        to identify potential data loss during migration.
+    #>
+    param(
+        [string]$SourceUrl,
+        [string]$SourceToken,
+        [string]$TargetUrl,
+        [string]$TargetToken,
+        [array]$SourceSecrets = @()
+    )
+
+    Write-Log "[$script:CorrelationId] Validating template mappings..." -Level Info
+
+    $result = @{
+        Mapped = @()
+        Unmapped = @()
+        FieldMismatches = @()
+        AffectedSecrets = @()
+        SourceTemplates = @()
+        TargetTemplates = @()
+    }
+
+    # Get templates from both servers
+    $sourceTemplates = Get-SecretTemplatesFromServer -BaseUrl $SourceUrl -Token $SourceToken
+    $targetTemplates = Get-SecretTemplatesFromServer -BaseUrl $TargetUrl -Token $TargetToken
+    $result.SourceTemplates = $sourceTemplates
+    $result.TargetTemplates = $targetTemplates
+
+    # Build target template lookup by name
+    $targetTemplateByName = @{}
+    foreach ($template in $targetTemplates) {
+        $targetTemplateByName[$template.name.ToLower()] = $template
+    }
+
+    # Determine which templates are actually used by secrets
+    $usedTemplateIds = @{}
+    foreach ($secret in $SourceSecrets) {
+        if ($secret.secretTemplateId) {
+            $usedTemplateIds[$secret.secretTemplateId] = $true
+        }
+    }
+
+    # Map source templates to target
+    foreach ($template in $sourceTemplates) {
+        # Skip templates not used by any secrets we're migrating
+        $isUsed = $usedTemplateIds.ContainsKey($template.id)
+
+        $targetMatch = $targetTemplateByName[$template.name.ToLower()]
+        if ($targetMatch) {
+            Set-IdMapping -ObjectType 'Templates' -SourceId $template.id -TargetId $targetMatch.id -Name $template.name
+            $result.Mapped += @{
+                SourceId = $template.id
+                TargetId = $targetMatch.id
+                Name = $template.name
+                IsUsed = $isUsed
+            }
+        }
+        elseif ($isUsed) {
+            # Only flag as unmapped if actually used
+            $result.Unmapped += @{
+                SourceId = $template.id
+                Name = $template.name
+            }
+        }
+    }
+
+    # Find secrets using unmapped templates
+    if ($result.Unmapped.Count -gt 0) {
+        $unmappedIds = $result.Unmapped | ForEach-Object { $_.SourceId }
+        foreach ($secret in $SourceSecrets) {
+            if ($secret.secretTemplateId -in $unmappedIds) {
+                $result.AffectedSecrets += @{
+                    SecretId = $secret.id
+                    SecretName = $secret.name
+                    TemplateId = $secret.secretTemplateId
+                }
+            }
+        }
+    }
+
+    # Update validation report
+    $script:ValidationReport.Templates = $result
+
+    if ($result.Unmapped.Count -gt 0) {
+        $msg = "Template mapping: $($result.Mapped.Count) mapped, $($result.Unmapped.Count) UNMAPPED"
+        if ($result.AffectedSecrets.Count -gt 0) {
+            $msg += " ($($result.AffectedSecrets.Count) secrets affected)"
+        }
+        Write-Log "[$script:CorrelationId] $msg" -Level Warning
+        $script:ValidationReport.Blocking += "[E2002] Missing templates: $($result.Unmapped.Name -join ', ')"
+    }
+    else {
+        Write-Log "[$script:CorrelationId] Template mapping: $($result.Mapped.Count) templates mapped successfully" -Level Success
+    }
+
+    return $result
+}
+
+function Show-ValidationReport {
+    <#
+    .SYNOPSIS
+        Display the pre-flight validation report
+    #>
+
+    Write-Host ""
+    Write-Host "┌─────────────────────────────────────────────────────────────┐" -ForegroundColor Cyan
+    Write-Host "│  PRE-FLIGHT VALIDATION REPORT                               │" -ForegroundColor Cyan
+    Write-Host "├─────────────────────────────────────────────────────────────┤" -ForegroundColor Cyan
+
+    # Sites
+    $sitesMapped = $script:ValidationReport.Sites.Mapped.Count
+    $sitesUnmapped = $script:ValidationReport.Sites.Unmapped.Count
+    $sitesAffected = $script:ValidationReport.Sites.AffectedSecrets.Count
+    if ($sitesUnmapped -gt 0) {
+        Write-Host "│  Sites:     $sitesMapped mapped, " -NoNewline -ForegroundColor White
+        Write-Host "$sitesUnmapped UNMAPPED" -NoNewline -ForegroundColor Red
+        Write-Host " ($sitesAffected secrets affected)" -ForegroundColor White
+    }
+    else {
+        Write-Host "│  Sites:     $sitesMapped mapped " -NoNewline -ForegroundColor White
+        Write-Host "✓" -ForegroundColor Green
+    }
+
+    # Templates
+    $templatesMapped = $script:ValidationReport.Templates.Mapped.Count
+    $templatesUnmapped = $script:ValidationReport.Templates.Unmapped.Count
+    $templatesAffected = $script:ValidationReport.Templates.AffectedSecrets.Count
+    if ($templatesUnmapped -gt 0) {
+        Write-Host "│  Templates: $templatesMapped mapped, " -NoNewline -ForegroundColor White
+        Write-Host "$templatesUnmapped UNMAPPED" -NoNewline -ForegroundColor Red
+        Write-Host " ($templatesAffected secrets affected)" -ForegroundColor White
+
+        # List unmapped templates
+        foreach ($t in $script:ValidationReport.Templates.Unmapped) {
+            Write-Host "│             • $($t.Name)" -ForegroundColor Yellow
+        }
+    }
+    else {
+        Write-Host "│  Templates: $templatesMapped mapped " -NoNewline -ForegroundColor White
+        Write-Host "✓" -ForegroundColor Green
+    }
+
+    # Summary
+    Write-Host "├─────────────────────────────────────────────────────────────┤" -ForegroundColor Cyan
+
+    $blockingCount = $script:ValidationReport.Blocking.Count
+    $warningCount = $script:ValidationReport.Warnings.Count
+
+    if ($blockingCount -gt 0) {
+        Write-Host "│  BLOCKING ISSUES: " -NoNewline -ForegroundColor White
+        Write-Host "$blockingCount" -ForegroundColor Red
+        foreach ($issue in $script:ValidationReport.Blocking) {
+            Write-Host "│  • $issue" -ForegroundColor Red
+        }
+    }
+
+    if ($warningCount -gt 0) {
+        Write-Host "│  WARNINGS: " -NoNewline -ForegroundColor White
+        Write-Host "$warningCount" -ForegroundColor Yellow
+        foreach ($warning in $script:ValidationReport.Warnings) {
+            Write-Host "│  • $warning" -ForegroundColor Yellow
+        }
+    }
+
+    if ($blockingCount -eq 0 -and $warningCount -eq 0) {
+        Write-Host "│  " -NoNewline
+        Write-Host "All pre-flight checks passed!" -ForegroundColor Green
+    }
+
+    Write-Host "└─────────────────────────────────────────────────────────────┘" -ForegroundColor Cyan
+    Write-Host ""
+
+    return $blockingCount -eq 0
+}
+
+function Invoke-PreFlightValidation {
+    <#
+    .SYNOPSIS
+        Run all pre-flight validation checks
+    .RETURNS
+        $true if migration can proceed, $false if blocking issues
+    #>
+    param(
+        [string]$SourceUrl,
+        [string]$SourceToken,
+        [string]$TargetUrl,
+        [string]$TargetToken,
+        [array]$SourceSecrets = @()
+    )
+
+    Write-Log "[$script:CorrelationId] Starting pre-flight validation..." -Level Info
+    $script:State.CurrentPhase = "Validation"
+    Save-Checkpoint
+
+    # Clear previous validation results
+    $script:ValidationReport.Blocking = @()
+    $script:ValidationReport.Warnings = @()
+
+    # Run validations
+    $siteResult = Test-SiteMapping -SourceUrl $SourceUrl -SourceToken $SourceToken `
+        -TargetUrl $TargetUrl -TargetToken $TargetToken -SourceSecrets $SourceSecrets
+
+    $templateResult = Test-TemplateMapping -SourceUrl $SourceUrl -SourceToken $SourceToken `
+        -TargetUrl $TargetUrl -TargetToken $TargetToken -SourceSecrets $SourceSecrets
+
+    # Check for blocking site issues
+    if ($siteResult.Unmapped.Count -gt 0 -and $siteResult.AffectedSecrets.Count -gt 0) {
+        $script:ValidationReport.Blocking += "[E2001] $($siteResult.AffectedSecrets.Count) secrets use unmapped sites"
+    }
+
+    # Show report
+    $canProceed = Show-ValidationReport
+
+    if (-not $canProceed) {
+        Write-Host "Migration cannot proceed until blocking issues are resolved." -ForegroundColor Red
+        Write-Host "Options:" -ForegroundColor Yellow
+        Write-Host "  1. Create missing sites/templates on target manually" -ForegroundColor White
+        Write-Host "  2. Remove affected secrets from migration scope" -ForegroundColor White
+        Write-Host "  3. Use -Force to proceed anyway (data loss may occur)" -ForegroundColor White
+    }
+
+    Save-Checkpoint
+    return $canProceed
+}
+
 #endregion
 
 #region Migration Functions
@@ -899,6 +1700,19 @@ function Export-Secrets {
             try {
                 $secret = Invoke-SSApi -BaseUrl $BaseUrl -Endpoint "secrets/$($summary.id)" -Token $Token
 
+                # Capture RPC/privileged account configuration (v3.0)
+                $rpcConfig = @{
+                    autoChangeEnabled = $secret.autoChangeEnabled
+                    autoChangeNextPassword = $secret.autoChangeNextPassword
+                    enableInheritSecretPolicy = $secret.enableInheritSecretPolicy
+                    passwordTypeWebScriptId = $secret.passwordTypeWebScriptId
+                    # Privileged account reference - key for two-pass migration
+                    launcherConnectAsSecretId = $secret.launcherConnectAsSecretId
+                    # Additional RPC fields that may exist
+                    isDoubleLock = $secret.isDoubleLock
+                    doubleLockId = $secret.doubleLockId
+                }
+
                 [void]$allSecrets.Add([PSCustomObject]@{
                     id = $secret.id
                     name = $secret.name
@@ -913,6 +1727,9 @@ function Export-Secrets {
                     autoChangeEnabled = $secret.autoChangeEnabled
                     requiresComment = $secret.requiresComment
                     checkOutEnabled = $secret.checkOutEnabled
+                    # v3.0: RPC configuration for two-pass migration
+                    rpcConfig = $rpcConfig
+                    launcherConnectAsSecretId = $secret.launcherConnectAsSecretId
                 })
             }
             catch {
@@ -1284,6 +2101,569 @@ function Test-Migration {
         Missing = $missing
     }
 }
+
+#region Folder Migration (v3.0)
+
+function Export-Folders {
+    <#
+    .SYNOPSIS
+        Export all folders from source with full hierarchy
+    .DESCRIPTION
+        Fetches folders and captures: id, name, parentFolderId, secretPolicyId, inheritSecretPolicy
+    #>
+    param(
+        [string]$BaseUrl,
+        [string]$Token
+    )
+
+    Write-Log "[$script:CorrelationId] Exporting folders from source..." -Level Info
+
+    $allFolders = [System.Collections.ArrayList]::new()
+
+    try {
+        $response = Invoke-SSApi -BaseUrl $BaseUrl -Endpoint "folders?take=1000" -Token $Token
+        if ($response.records) {
+            foreach ($folder in $response.records) {
+                [void]$allFolders.Add([PSCustomObject]@{
+                    id = $folder.id
+                    folderName = $folder.folderName
+                    parentFolderId = $folder.parentFolderId
+                    secretPolicyId = $folder.secretPolicyId
+                    inheritSecretPolicy = $folder.inheritSecretPolicy
+                    folderPath = $folder.folderPath
+                })
+            }
+        }
+    }
+    catch {
+        Write-Log "[$script:CorrelationId] Error fetching folders: $_" -Level Error
+        return @()
+    }
+
+    Write-Log "[$script:CorrelationId] Exported $($allFolders.Count) folders" -Level Success
+    return $allFolders
+}
+
+function Sort-FoldersByDepth {
+    <#
+    .SYNOPSIS
+        Sort folders by hierarchy depth (parents before children)
+    .DESCRIPTION
+        Uses parentFolderId to determine depth. Root folders (parentFolderId = -1) come first.
+    #>
+    param(
+        [array]$Folders
+    )
+
+    # Build depth map
+    $depthMap = @{}
+    foreach ($folder in $Folders) {
+        $depth = 0
+        $current = $folder
+        $visited = @{}
+
+        while ($current.parentFolderId -and $current.parentFolderId -ne -1) {
+            if ($visited.ContainsKey($current.id)) {
+                Write-Log "[$script:CorrelationId] Circular folder reference detected at folder $($current.id)" -Level Warning
+                break
+            }
+            $visited[$current.id] = $true
+            $depth++
+            $parent = $Folders | Where-Object { $_.id -eq $current.parentFolderId }
+            if (-not $parent) { break }
+            $current = $parent
+        }
+        $depthMap[$folder.id] = $depth
+    }
+
+    # Sort by depth (ascending - parents first)
+    return $Folders | Sort-Object { $depthMap[$_.id] }
+}
+
+function Import-FoldersPass1 {
+    <#
+    .SYNOPSIS
+        Import folders WITHOUT policy assignments (Pass 1)
+    .DESCRIPTION
+        Creates folder hierarchy on target. Policies assigned in Pass 2 after policies are created.
+    #>
+    param(
+        [string]$TargetUrl,
+        [string]$TargetToken,
+        [array]$Folders
+    )
+
+    Write-Log "[$script:CorrelationId] Creating folder structure on target (Pass 1)..." -Level Info
+
+    $sorted = Sort-FoldersByDepth -Folders $Folders
+    $created = 0
+    $skipped = 0
+    $failed = 0
+
+    foreach ($folder in $sorted) {
+        # Skip root folder (cannot create)
+        if ($folder.parentFolderId -eq -1 -and $folder.folderName -eq "Root") {
+            # Map root to root (usually ID 1 on both)
+            Set-IdMapping -ObjectType 'Folders' -SourceId $folder.id -TargetId -1 -Name $folder.folderName
+            $skipped++
+            continue
+        }
+
+        try {
+            # Map parent folder ID
+            $targetParentId = Get-MappedId -ObjectType 'Folders' -SourceId $folder.parentFolderId
+            if (-not $targetParentId -and $folder.parentFolderId -ne -1) {
+                Write-Log "[$script:CorrelationId] Skipping folder '$($folder.folderName)' - parent not mapped" -Level Warning
+                $skipped++
+                continue
+            }
+
+            # Check if folder already exists
+            $existing = Invoke-SSApi -BaseUrl $TargetUrl -Endpoint "folders?filter.searchText=$([uri]::EscapeDataString($folder.folderName))&take=100" -Token $TargetToken
+            $match = $existing.records | Where-Object {
+                $_.folderName -eq $folder.folderName -and $_.parentFolderId -eq $targetParentId
+            }
+
+            if ($match) {
+                Set-IdMapping -ObjectType 'Folders' -SourceId $folder.id -TargetId $match.id -Name $folder.folderName
+                Write-Log "[$script:CorrelationId] Folder '$($folder.folderName)' already exists (ID: $($match.id))" -Level Debug
+                $skipped++
+                continue
+            }
+
+            # Create folder (without policy - that's Pass 2)
+            $body = @{
+                folderName = $folder.folderName
+                parentFolderId = if ($targetParentId) { $targetParentId } else { -1 }
+                inheritSecretPolicy = $true  # Default to inherit until we set explicit policy
+                secretPolicyId = -1
+            }
+
+            $result = Invoke-SSApi -BaseUrl $TargetUrl -Endpoint "folders" -Method POST -Body $body -Token $TargetToken
+            Set-IdMapping -ObjectType 'Folders' -SourceId $folder.id -TargetId $result.id -Name $folder.folderName
+            $created++
+
+            Show-Progress -Activity "Creating folders" -Current ($created + $skipped + $failed) -Total $sorted.Count
+        }
+        catch {
+            Write-Log "[$script:CorrelationId] Failed to create folder '$($folder.folderName)': $_" -Level Error
+            $failed++
+        }
+    }
+
+    Write-Host ""
+    Write-Log "[$script:CorrelationId] Folder Pass 1: $created created, $skipped skipped, $failed failed" -Level $(if ($failed -eq 0) { 'Success' } else { 'Warning' })
+
+    return @{
+        Created = $created
+        Skipped = $skipped
+        Failed = $failed
+    }
+}
+
+function Export-SecretPolicies {
+    <#
+    .SYNOPSIS
+        Export all secret policies from source
+    #>
+    param(
+        [string]$BaseUrl,
+        [string]$Token
+    )
+
+    Write-Log "[$script:CorrelationId] Exporting secret policies from source..." -Level Info
+
+    $allPolicies = [System.Collections.ArrayList]::new()
+
+    try {
+        $response = Invoke-SSApi -BaseUrl $BaseUrl -Endpoint "secret-policies?take=1000" -Token $Token
+        if ($response.records) {
+            foreach ($policy in $response.records) {
+                # Get full policy details
+                try {
+                    $fullPolicy = Invoke-SSApi -BaseUrl $BaseUrl -Endpoint "secret-policies/$($policy.id)" -Token $Token
+                    [void]$allPolicies.Add($fullPolicy)
+                }
+                catch {
+                    Write-Log "[$script:CorrelationId] Could not fetch details for policy $($policy.id): $_" -Level Warning
+                    [void]$allPolicies.Add($policy)
+                }
+            }
+        }
+    }
+    catch {
+        Write-Log "[$script:CorrelationId] Error fetching policies: $_" -Level Error
+        return @()
+    }
+
+    Write-Log "[$script:CorrelationId] Exported $($allPolicies.Count) secret policies" -Level Success
+    return $allPolicies
+}
+
+function Import-SecretPolicies {
+    <#
+    .SYNOPSIS
+        Import secret policies to target
+    .DESCRIPTION
+        Creates policies on target. Handles duplicates based on policy name.
+    #>
+    param(
+        [string]$TargetUrl,
+        [string]$TargetToken,
+        [array]$Policies,
+        [ValidateSet('Skip', 'Rename', 'Fail')]
+        [string]$ConflictPolicy = 'Skip'
+    )
+
+    Write-Log "[$script:CorrelationId] Importing secret policies to target..." -Level Info
+
+    # Get existing policies on target for duplicate check
+    $existingPolicies = @{}
+    try {
+        $existing = Invoke-SSApi -BaseUrl $TargetUrl -Endpoint "secret-policies?take=1000" -Token $TargetToken
+        foreach ($p in $existing.records) {
+            $existingPolicies[$p.secretPolicyName.ToLower()] = $p
+        }
+    }
+    catch {
+        Write-Log "[$script:CorrelationId] Could not fetch existing policies: $_" -Level Warning
+    }
+
+    $created = 0
+    $skipped = 0
+    $failed = 0
+
+    foreach ($policy in $Policies) {
+        $policyName = $policy.secretPolicyName
+
+        # Check for existing policy
+        $match = $existingPolicies[$policyName.ToLower()]
+        if ($match) {
+            if ($ConflictPolicy -eq 'Skip') {
+                Set-IdMapping -ObjectType 'Policies' -SourceId $policy.secretPolicyId -TargetId $match.secretPolicyId -Name $policyName
+                Write-Log "[$script:CorrelationId] Policy '$policyName' already exists - mapping to existing" -Level Debug
+                $skipped++
+                continue
+            }
+            elseif ($ConflictPolicy -eq 'Rename') {
+                $policyName = "$policyName-migrated"
+            }
+            elseif ($ConflictPolicy -eq 'Fail') {
+                Write-Log "[$script:CorrelationId] Policy '$policyName' already exists - stopping" -Level Error
+                throw "Policy name conflict: $policyName"
+            }
+        }
+
+        try {
+            # Create policy - stripping source-specific IDs
+            $body = @{
+                secretPolicyName = $policyName
+                secretPolicyDescription = $policy.secretPolicyDescription
+                active = $policy.active
+            }
+
+            # Add policy items if present (settings like checkout, expiration, etc.)
+            if ($policy.secretPolicyItems) {
+                $body.secretPolicyItems = $policy.secretPolicyItems
+            }
+
+            $result = Invoke-SSApi -BaseUrl $TargetUrl -Endpoint "secret-policies" -Method POST -Body $body -Token $TargetToken
+            Set-IdMapping -ObjectType 'Policies' -SourceId $policy.secretPolicyId -TargetId $result.secretPolicyId -Name $policyName
+            $created++
+
+            Show-Progress -Activity "Creating policies" -Current ($created + $skipped + $failed) -Total $Policies.Count
+        }
+        catch {
+            Write-Log "[$script:CorrelationId] Failed to create policy '$policyName': $_" -Level Error
+            $failed++
+        }
+    }
+
+    Write-Host ""
+    Write-Log "[$script:CorrelationId] Policy import: $created created, $skipped skipped, $failed failed" -Level $(if ($failed -eq 0) { 'Success' } else { 'Warning' })
+
+    return @{
+        Created = $created
+        Skipped = $skipped
+        Failed = $failed
+    }
+}
+
+function Update-FolderPolicies {
+    <#
+    .SYNOPSIS
+        Assign policies to folders (Pass 2)
+    .DESCRIPTION
+        After policies are created, update folders that had specific policy assignments.
+    #>
+    param(
+        [string]$TargetUrl,
+        [string]$TargetToken,
+        [array]$SourceFolders
+    )
+
+    Write-Log "[$script:CorrelationId] Assigning policies to folders (Pass 2)..." -Level Info
+
+    $updated = 0
+    $skipped = 0
+    $failed = 0
+
+    foreach ($folder in $SourceFolders) {
+        # Skip folders that inherit or have no policy
+        if ($folder.inheritSecretPolicy -or -not $folder.secretPolicyId -or $folder.secretPolicyId -eq -1) {
+            $skipped++
+            continue
+        }
+
+        $targetFolderId = Get-MappedId -ObjectType 'Folders' -SourceId $folder.id
+        $targetPolicyId = Get-MappedId -ObjectType 'Policies' -SourceId $folder.secretPolicyId
+
+        if (-not $targetFolderId) {
+            Write-Log "[$script:CorrelationId] Skipping folder '$($folder.folderName)' - not mapped" -Level Debug
+            $skipped++
+            continue
+        }
+
+        if (-not $targetPolicyId) {
+            Write-Log "[$script:CorrelationId] Skipping folder '$($folder.folderName)' - policy not mapped" -Level Warning
+            $skipped++
+            continue
+        }
+
+        try {
+            $body = @{
+                id = $targetFolderId
+                secretPolicyId = $targetPolicyId
+                inheritSecretPolicy = $false
+            }
+
+            Invoke-SSApi -BaseUrl $TargetUrl -Endpoint "folders/$targetFolderId" -Method PUT -Body $body -Token $TargetToken
+            $updated++
+
+            Show-Progress -Activity "Assigning policies" -Current ($updated + $skipped + $failed) -Total $SourceFolders.Count
+        }
+        catch {
+            Write-Log "[$script:CorrelationId] Failed to update folder '$($folder.folderName)' policy: $_" -Level Error
+            $failed++
+        }
+    }
+
+    Write-Host ""
+    Write-Log "[$script:CorrelationId] Folder Pass 2: $updated updated, $skipped skipped, $failed failed" -Level $(if ($failed -eq 0) { 'Success' } else { 'Warning' })
+
+    return @{
+        Updated = $updated
+        Skipped = $skipped
+        Failed = $failed
+    }
+}
+
+#endregion Folder Migration
+
+#region Two-Pass Secret Migration (v3.0 - RPC/Privileged Account Linking)
+
+function Get-SecretsWithRpc {
+    <#
+    .SYNOPSIS
+        Identify secrets that have RPC/privileged account configuration
+    .DESCRIPTION
+        Returns secrets that reference other secrets as privileged accounts.
+        These need Pass 2 processing to link after all secrets exist.
+    #>
+    param(
+        [array]$Secrets
+    )
+
+    $secretsWithRpc = @()
+    foreach ($secret in $Secrets) {
+        # Check for privileged account reference
+        if ($secret.launcherConnectAsSecretId -and $secret.launcherConnectAsSecretId -gt 0) {
+            $secretsWithRpc += $secret
+        }
+        # Also check rpcConfig if present
+        elseif ($secret.rpcConfig -and $secret.rpcConfig.launcherConnectAsSecretId -and $secret.rpcConfig.launcherConnectAsSecretId -gt 0) {
+            $secretsWithRpc += $secret
+        }
+    }
+
+    return $secretsWithRpc
+}
+
+function Test-CircularRpcReferences {
+    <#
+    .SYNOPSIS
+        Detect circular references in privileged account chains
+    .DESCRIPTION
+        A->B->A is a circular reference. These secrets cannot have RPC
+        enabled on both ends during migration. Returns cycles found.
+    #>
+    param(
+        [array]$Secrets
+    )
+
+    Write-Log "[$script:CorrelationId] Checking for circular RPC references..." -Level Debug
+
+    # Build adjacency map: secretId -> privilegedSecretId
+    $graph = @{}
+    foreach ($secret in $Secrets) {
+        $privId = $secret.launcherConnectAsSecretId
+        if (-not $privId -and $secret.rpcConfig) {
+            $privId = $secret.rpcConfig.launcherConnectAsSecretId
+        }
+        if ($privId -and $privId -gt 0) {
+            $graph[$secret.id] = $privId
+        }
+    }
+
+    $cycles = @()
+    $visited = @{}
+    $inStack = @{}
+
+    function Find-Cycle($nodeId, $path) {
+        if ($inStack[$nodeId]) {
+            # Found cycle - extract the cycle portion
+            $cycleStart = $path.IndexOf($nodeId)
+            return $path[$cycleStart..($path.Count - 1)]
+        }
+        if ($visited[$nodeId]) {
+            return $null
+        }
+
+        $visited[$nodeId] = $true
+        $inStack[$nodeId] = $true
+        $path += $nodeId
+
+        if ($graph.ContainsKey($nodeId)) {
+            $nextId = $graph[$nodeId]
+            $cycle = Find-Cycle $nextId $path
+            if ($cycle) {
+                return $cycle
+            }
+        }
+
+        $inStack[$nodeId] = $false
+        return $null
+    }
+
+    foreach ($secretId in $graph.Keys) {
+        if (-not $visited[$secretId]) {
+            $cycle = Find-Cycle $secretId @()
+            if ($cycle -and $cycle.Count -gt 0) {
+                $cycles += ,@($cycle)
+            }
+        }
+    }
+
+    if ($cycles.Count -gt 0) {
+        Write-Log "[$script:CorrelationId] Found $($cycles.Count) circular RPC reference(s)" -Level Warning
+        $script:ValidationReport.CircularRefs = @{
+            Cycles = $cycles
+            AffectedSecrets = $cycles | ForEach-Object { $_ } | Select-Object -Unique
+        }
+    }
+    else {
+        Write-Log "[$script:CorrelationId] No circular RPC references found" -Level Debug
+    }
+
+    return $cycles
+}
+
+function Update-SecretRpcConfig {
+    <#
+    .SYNOPSIS
+        Update secrets with RPC/privileged account references (Pass 2)
+    .DESCRIPTION
+        After all secrets are created, update those that reference privileged
+        accounts with the mapped target secret IDs.
+    #>
+    param(
+        [string]$TargetUrl,
+        [string]$TargetToken,
+        [array]$SourceSecrets,
+        [array]$CircularSecretIds = @()
+    )
+
+    Write-Log "[$script:CorrelationId] Updating secrets with RPC configuration (Pass 2)..." -Level Info
+
+    $secretsWithRpc = Get-SecretsWithRpc -Secrets $SourceSecrets
+    if ($secretsWithRpc.Count -eq 0) {
+        Write-Log "[$script:CorrelationId] No secrets with RPC configuration to update" -Level Info
+        return @{ Updated = 0; Skipped = 0; Failed = 0 }
+    }
+
+    Write-Log "[$script:CorrelationId] Found $($secretsWithRpc.Count) secrets with privileged account references" -Level Info
+
+    $updated = 0
+    $skipped = 0
+    $failed = 0
+
+    foreach ($secret in $secretsWithRpc) {
+        # Get source privileged account ID
+        $sourcePrivId = $secret.launcherConnectAsSecretId
+        if (-not $sourcePrivId -and $secret.rpcConfig) {
+            $sourcePrivId = $secret.rpcConfig.launcherConnectAsSecretId
+        }
+
+        # Skip circular references (these can't be linked)
+        if ($secret.id -in $CircularSecretIds) {
+            Write-Log "[$script:CorrelationId] Skipping '$($secret.name)' - circular reference" -Level Warning
+            $script:ValidationReport.Warnings += "Secret '$($secret.name)' has circular RPC reference - created without RPC link"
+            $skipped++
+            continue
+        }
+
+        # Get mapped target IDs
+        $targetSecretId = Get-MappedId -ObjectType 'Secrets' -SourceId $secret.id
+        $targetPrivId = Get-MappedId -ObjectType 'Secrets' -SourceId $sourcePrivId
+
+        if (-not $targetSecretId) {
+            Write-Log "[$script:CorrelationId] Skipping '$($secret.name)' - not mapped to target" -Level Warning
+            $skipped++
+            continue
+        }
+
+        if (-not $targetPrivId) {
+            Write-Log "[$script:CorrelationId] Skipping '$($secret.name)' - privileged account (source ID: $sourcePrivId) not mapped" -Level Warning
+            $script:ValidationReport.Warnings += "Secret '$($secret.name)' privileged account not found on target"
+            $skipped++
+            continue
+        }
+
+        try {
+            # Update secret with privileged account reference
+            $body = @{
+                launcherConnectAsSecretId = $targetPrivId
+            }
+
+            # Enable auto-change if it was enabled on source
+            if ($secret.autoChangeEnabled -or ($secret.rpcConfig -and $secret.rpcConfig.autoChangeEnabled)) {
+                $body.autoChangeEnabled = $true
+            }
+
+            Invoke-SSApi -BaseUrl $TargetUrl -Endpoint "secrets/$targetSecretId" -Method PUT -Body $body -Token $TargetToken
+            $updated++
+
+            Write-Log "[$script:CorrelationId] Linked '$($secret.name)' to privileged account (target ID: $targetPrivId)" -Level Debug
+            Show-Progress -Activity "Linking RPC" -Current ($updated + $skipped + $failed) -Total $secretsWithRpc.Count
+        }
+        catch {
+            Write-Log "[$script:CorrelationId] Failed to update RPC for '$($secret.name)': $_" -Level Error
+            $failed++
+        }
+    }
+
+    Write-Host ""
+    Write-Log "[$script:CorrelationId] RPC Pass 2: $updated linked, $skipped skipped, $failed failed" -Level $(if ($failed -eq 0) { 'Success' } else { 'Warning' })
+
+    return @{
+        Updated = $updated
+        Skipped = $skipped
+        Failed = $failed
+    }
+}
+
+#endregion Two-Pass Secret Migration
+
 #endregion
 
 #region Main Wizard
@@ -1355,21 +2735,27 @@ function Start-FullMigration {
 
     Write-Log "Authenticating to source..." -Level Info
     try {
-        $script:State.SourceToken = Get-SSToken -BaseUrl $script:State.SourceUrl -Username $sourceUser -Password $sourcePass
+        $authResult = Get-SSToken -BaseUrl $script:State.SourceUrl -Username $sourceUser -Password $sourcePass
+        $script:State.SourceToken = $authResult.Token
+        $script:State.SourceTokenExpiry = $authResult.Expiry
         Write-Log "Source authentication successful" -Level Success
     }
     catch {
-        Write-Log "Source authentication failed: $_" -Level Error
+        $errMsg = Get-ErrorMessage -Code "E1001" -Details "Source: $_" -Resolution "Check credentials and API access"
+        Write-Log $errMsg -Level Error
         return
     }
 
     Write-Log "Authenticating to target..." -Level Info
     try {
-        $script:State.TargetToken = Get-SSToken -BaseUrl $script:State.TargetUrl -Username $targetUser -Password $targetPass
+        $authResult = Get-SSToken -BaseUrl $script:State.TargetUrl -Username $targetUser -Password $targetPass
+        $script:State.TargetToken = $authResult.Token
+        $script:State.TargetTokenExpiry = $authResult.Expiry
         Write-Log "Target authentication successful" -Level Success
     }
     catch {
-        Write-Log "Target authentication failed: $_" -Level Error
+        $errMsg = Get-ErrorMessage -Code "E1001" -Details "Target: $_" -Resolution "Check credentials and API access"
+        Write-Log $errMsg -Level Error
         return
     }
 
@@ -1386,7 +2772,8 @@ function Start-FullMigration {
     Write-Log "  Secret count: $($sourcePerms.SecretCount)" -Level Info
 
     if (-not $sourcePerms.CanListSecrets -or -not $sourcePerms.CanReadSecrets) {
-        Write-Log "Insufficient source permissions. Cannot proceed." -Level Error
+        $errMsg = Get-ErrorMessage -Code "E2006" -Details "Source needs List and Read Secrets" -Resolution "Grant 'View Secret' role to user"
+        Write-Log $errMsg -Level Error
         return
     }
 
@@ -1396,13 +2783,75 @@ function Start-FullMigration {
     Write-Log "  Existing secrets: $($targetPerms.SecretCount)" -Level Info
 
     if (-not $targetPerms.CanCreateSecrets) {
-        Write-Log "Insufficient target permissions. Cannot proceed." -Level Error
+        $errMsg = Get-ErrorMessage -Code "E2006" -Details "Target needs Create Secrets" -Resolution "Grant 'Add Secret' role to user"
+        Write-Log $errMsg -Level Error
         return
     }
 
     Write-Log "Pre-flight checks passed!" -Level Success
 
-    # Step 2b: Duplicate Name Policy
+    # Step 2b: Migration Mode Selection (v3.0)
+    Write-Host "`nMIGRATION MODE" -ForegroundColor Cyan
+    Write-Host "--------------`n"
+
+    Write-Host "Choose what to migrate:" -ForegroundColor Yellow
+    Write-Host ""
+
+    $modeChoice = Show-Menu -Title "Migration Mode" -Options @(
+        "Secrets Only - Migrate secrets to existing folder structure (fastest)"
+        "Full Migration - Migrate folders, policies, AND secrets (complete)"
+    )
+
+    $script:MigrationMode = switch ($modeChoice) {
+        0 { "SecretsOnly" }
+        1 { "Full" }
+    }
+
+    Write-Log "Migration mode: $script:MigrationMode" -Level Info
+
+    # Full mode: Run pre-flight validation for sites/templates
+    if ($script:MigrationMode -eq "Full") {
+        Write-Host "`nPRE-FLIGHT VALIDATION" -ForegroundColor Cyan
+        Write-Host "---------------------`n"
+
+        Write-Log "Running pre-flight validation for Full migration..." -Level Info
+
+        # Get secrets for validation (lightweight list)
+        $secretList = (Invoke-SSApi -BaseUrl $script:State.SourceUrl -Endpoint "secrets?take=10000" -Token $script:State.SourceToken).records
+
+        $canProceed = Invoke-PreFlightValidation `
+            -SourceUrl $script:State.SourceUrl -SourceToken $script:State.SourceToken `
+            -TargetUrl $script:State.TargetUrl -TargetToken $script:State.TargetToken `
+            -SourceSecrets $secretList
+
+        if (-not $canProceed) {
+            Write-Host ""
+            $forceChoice = Show-Menu -Title "Blocking issues detected. How to proceed?" -Options @(
+                "Abort migration"
+                "Continue anyway (may cause failures)"
+                "Switch to Secrets Only mode"
+            )
+
+            switch ($forceChoice) {
+                0 {
+                    Write-Log "Migration aborted due to blocking issues." -Level Warning
+                    return
+                }
+                1 {
+                    Write-Log "Continuing despite blocking issues (user override)" -Level Warning
+                }
+                2 {
+                    $script:MigrationMode = "SecretsOnly"
+                    Write-Log "Switched to SecretsOnly mode" -Level Info
+                }
+            }
+        }
+        else {
+            Write-Log "Pre-flight validation passed!" -Level Success
+        }
+    }
+
+    # Step 2c: Duplicate Name Policy
     Write-Host "`nDUPLICATE NAME HANDLING" -ForegroundColor Cyan
     Write-Host "-----------------------`n"
 
@@ -1429,7 +2878,22 @@ function Start-FullMigration {
     Write-Log "Duplicate policy set to: $($script:Config.DuplicateNamePolicy)" -Level Info
 
     # Step 3: Export
-    Write-Host "`nSTEP 3: Export Secrets" -ForegroundColor Cyan
+    # Step 3: Export (folders/policies if Full mode, then secrets)
+    if ($script:MigrationMode -eq "Full") {
+        Write-Host "`nSTEP 3a: Export Folders & Policies" -ForegroundColor Cyan
+        Write-Host "----------------------------------`n"
+
+        Write-Log "Exporting folders from source..." -Level Info
+        $script:State.ExportedFolders = Export-Folders -BaseUrl $script:State.SourceUrl -Token $script:State.SourceToken
+
+        Write-Log "Exporting secret policies from source..." -Level Info
+        $script:State.ExportedPolicies = Export-SecretPolicies -BaseUrl $script:State.SourceUrl -Token $script:State.SourceToken
+
+        Write-Host "  Folders: $($script:State.ExportedFolders.Count)" -ForegroundColor Green
+        Write-Host "  Policies: $($script:State.ExportedPolicies.Count)" -ForegroundColor Green
+    }
+
+    Write-Host "`nSTEP 3$(if ($script:MigrationMode -eq 'Full') { 'b' } else { '' }): Export Secrets" -ForegroundColor Cyan
     Write-Host "----------------------`n"
 
     if (-not (Read-Confirmation "Ready to export $($sourcePerms.SecretCount) secrets from source?")) {
@@ -1520,7 +2984,42 @@ function Start-FullMigration {
     }
 
     # Step 5: Import
-    Write-Host "`nSTEP 5: Import Secrets" -ForegroundColor Cyan
+    # Step 5: Import (folders/policies if Full mode, then secrets)
+    if ($script:MigrationMode -eq "Full") {
+        Write-Host "`nSTEP 5a: Import Folders (Structure)" -ForegroundColor Cyan
+        Write-Host "-----------------------------------`n"
+
+        Write-Host "╔════════════════════════════════════════════════════════════╗" -ForegroundColor Red
+        Write-Host "║  WARNING: This will create folders on the target system!   ║" -ForegroundColor Red
+        Write-Host "╚════════════════════════════════════════════════════════════╝" -ForegroundColor Red
+        Write-Host ""
+
+        if (-not (Read-Confirmation "Create $($script:State.ExportedFolders.Count) folders on target?")) {
+            Write-Log "Folder import cancelled." -Level Warning
+            return
+        }
+
+        $folderResults = Import-FoldersPass1 -TargetUrl $script:State.TargetUrl -TargetToken $script:State.TargetToken -Folders $script:State.ExportedFolders
+        Save-Checkpoint
+
+        Write-Host "`nSTEP 5b: Import Secret Policies" -ForegroundColor Cyan
+        Write-Host "-------------------------------`n"
+
+        if ($script:State.ExportedPolicies.Count -gt 0) {
+            if (-not (Read-Confirmation "Create $($script:State.ExportedPolicies.Count) policies on target?")) {
+                Write-Log "Policy import cancelled." -Level Warning
+                return
+            }
+
+            $policyResults = Import-SecretPolicies -TargetUrl $script:State.TargetUrl -TargetToken $script:State.TargetToken -Policies $script:State.ExportedPolicies
+            Save-Checkpoint
+        }
+        else {
+            Write-Log "No policies to import" -Level Info
+        }
+    }
+
+    Write-Host "`nSTEP 5$(if ($script:MigrationMode -eq 'Full') { 'c' } else { '' }): Import Secrets" -ForegroundColor Cyan
     Write-Host "----------------------`n"
 
     Write-Host "╔════════════════════════════════════════════════════════════╗" -ForegroundColor Red
@@ -1547,7 +3046,72 @@ function Start-FullMigration {
         return
     }
 
+    # Check token validity before long-running import (tokens typically expire in 1 hour)
+    if (-not (Request-TokenRefresh -Phase "proceed with import")) {
+        Write-Log "Import cancelled - authentication required" -Level Warning
+        return
+    }
+
     $importResults = Import-Secrets -BaseUrl $script:State.TargetUrl -Token $script:State.TargetToken -Secrets $secrets -ExistingNames $existingNames
+
+    # Step 5d: Update folder policies (Full mode - Pass 2)
+    if ($script:MigrationMode -eq "Full" -and $script:State.ExportedFolders.Count -gt 0) {
+        Write-Host "`nSTEP 5d: Assign Policies to Folders" -ForegroundColor Cyan
+        Write-Host "-----------------------------------`n"
+
+        $foldersWithPolicies = $script:State.ExportedFolders | Where-Object {
+            -not $_.inheritSecretPolicy -and $_.secretPolicyId -and $_.secretPolicyId -ne -1
+        }
+
+        if ($foldersWithPolicies.Count -gt 0) {
+            Write-Log "Assigning policies to $($foldersWithPolicies.Count) folders..." -Level Info
+            $policyUpdateResults = Update-FolderPolicies -TargetUrl $script:State.TargetUrl -TargetToken $script:State.TargetToken -SourceFolders $script:State.ExportedFolders
+            Save-Checkpoint
+        }
+        else {
+            Write-Log "No folder policy assignments needed" -Level Info
+        }
+    }
+
+    # Step 5e: RPC/Privileged Account Linking (Pass 2 of two-pass secret migration)
+    Write-Host "`nSTEP 5$(if ($script:MigrationMode -eq 'Full') { 'e' } else { 'b' }): Link Privileged Accounts (RPC)" -ForegroundColor Cyan
+    Write-Host "-------------------------------------------`n"
+
+    # Check for secrets with RPC configuration
+    $secretsWithRpc = Get-SecretsWithRpc -Secrets $secrets
+    if ($secretsWithRpc.Count -gt 0) {
+        Write-Log "Found $($secretsWithRpc.Count) secrets with privileged account references" -Level Info
+
+        # Check for circular references
+        $cycles = Test-CircularRpcReferences -Secrets $secrets
+        $circularIds = @()
+        if ($cycles.Count -gt 0) {
+            Write-Host ""
+            Write-Host "WARNING: $($cycles.Count) circular RPC reference(s) detected!" -ForegroundColor Yellow
+            Write-Host "These secrets will be created without RPC linking:" -ForegroundColor Yellow
+            foreach ($cycle in $cycles) {
+                $cycleNames = $cycle | ForEach-Object {
+                    $id = $_
+                    ($secrets | Where-Object { $_.id -eq $id }).name
+                }
+                Write-Host "  • $($cycleNames -join ' → ') → ..." -ForegroundColor Gray
+                $circularIds += $cycle
+            }
+            Write-Host ""
+        }
+
+        if (-not (Read-Confirmation "Link $($secretsWithRpc.Count) secrets to their privileged accounts?")) {
+            Write-Log "RPC linking skipped by user" -Level Warning
+        }
+        else {
+            $rpcResults = Update-SecretRpcConfig -TargetUrl $script:State.TargetUrl -TargetToken $script:State.TargetToken `
+                -SourceSecrets $secrets -CircularSecretIds $circularIds
+            Save-Checkpoint
+        }
+    }
+    else {
+        Write-Log "No secrets have privileged account references - RPC linking not needed" -Level Info
+    }
 
     # Step 6: Validate
     Write-Host "`nSTEP 6: Validation" -ForegroundColor Cyan
@@ -1560,9 +3124,46 @@ function Start-FullMigration {
     Write-Host "                    MIGRATION COMPLETE                          " -ForegroundColor Cyan
     Write-Host "═══════════════════════════════════════════════════════════════`n" -ForegroundColor Cyan
 
-    Write-Host "Results:" -ForegroundColor Yellow
+    Write-Host "Migration Mode: $script:MigrationMode" -ForegroundColor Cyan
+    Write-Host ""
+
+    # Full mode: Show folder/policy results
+    if ($script:MigrationMode -eq "Full") {
+        Write-Host "Folders:" -ForegroundColor Yellow
+        Write-Host "  Created:     $($folderResults.Created)"
+        Write-Host "  Skipped:     $($folderResults.Skipped) (existing)"
+        Write-Host "  Failed:      $($folderResults.Failed)"
+        Write-Host ""
+
+        if ($policyResults) {
+            Write-Host "Policies:" -ForegroundColor Yellow
+            Write-Host "  Created:     $($policyResults.Created)"
+            Write-Host "  Skipped:     $($policyResults.Skipped) (existing)"
+            Write-Host "  Failed:      $($policyResults.Failed)"
+            Write-Host ""
+        }
+
+        if ($policyUpdateResults) {
+            Write-Host "Folder Policy Assignments:" -ForegroundColor Yellow
+            Write-Host "  Updated:     $($policyUpdateResults.Updated)"
+            Write-Host "  Skipped:     $($policyUpdateResults.Skipped)"
+            Write-Host "  Failed:      $($policyUpdateResults.Failed)"
+            Write-Host ""
+        }
+    }
+
+    Write-Host "Secrets:" -ForegroundColor Yellow
     Write-Host "  Exported:    $($secrets.Count)"
     Write-Host "  Imported:    $($importResults.Success.Count)"
+
+    # Show RPC linking results if applicable
+    if ($rpcResults) {
+        Write-Host ""
+        Write-Host "RPC/Privileged Account Linking:" -ForegroundColor Yellow
+        Write-Host "  Linked:      $($rpcResults.Updated)"
+        Write-Host "  Skipped:     $($rpcResults.Skipped)"
+        Write-Host "  Failed:      $($rpcResults.Failed)"
+    }
     Write-Host "  Skipped:     $($importResults.Skipped.Count) (duplicates)"
     Write-Host "  Renamed:     $($importResults.Renamed.Count)"
     Write-Host "  Failed:      $($importResults.Failed.Count)"
@@ -1604,7 +3205,9 @@ function Start-ExportOnly {
     $sourcePass = Read-SecurePrompt -Prompt "Password: "
 
     try {
-        $script:State.SourceToken = Get-SSToken -BaseUrl $script:State.SourceUrl -Username $sourceUser -Password $sourcePass
+        $authResult = Get-SSToken -BaseUrl $script:State.SourceUrl -Username $sourceUser -Password $sourcePass
+        $script:State.SourceToken = $authResult.Token
+        $script:State.SourceTokenExpiry = $authResult.Expiry
         Write-Log "Authentication successful" -Level Success
     }
     catch {
@@ -1644,7 +3247,9 @@ function Start-ImportFromFile {
     $targetPass = Read-SecurePrompt -Prompt "Password: "
 
     try {
-        $script:State.TargetToken = Get-SSToken -BaseUrl $script:State.TargetUrl -Username $targetUser -Password $targetPass
+        $authResult = Get-SSToken -BaseUrl $script:State.TargetUrl -Username $targetUser -Password $targetPass
+        $script:State.TargetToken = $authResult.Token
+        $script:State.TargetTokenExpiry = $authResult.Expiry
         Write-Log "Authentication successful" -Level Success
     }
     catch {
@@ -1685,8 +3290,13 @@ function Start-ValidationOnly {
     $targetPass = Read-SecurePrompt -Prompt "Password: "
 
     try {
-        $script:State.SourceToken = Get-SSToken -BaseUrl $script:State.SourceUrl -Username $sourceUser -Password $sourcePass
-        $script:State.TargetToken = Get-SSToken -BaseUrl $script:State.TargetUrl -Username $targetUser -Password $targetPass
+        $sourceAuth = Get-SSToken -BaseUrl $script:State.SourceUrl -Username $sourceUser -Password $sourcePass
+        $script:State.SourceToken = $sourceAuth.Token
+        $script:State.SourceTokenExpiry = $sourceAuth.Expiry
+
+        $targetAuth = Get-SSToken -BaseUrl $script:State.TargetUrl -Username $targetUser -Password $targetPass
+        $script:State.TargetToken = $targetAuth.Token
+        $script:State.TargetTokenExpiry = $targetAuth.Expiry
     }
     catch {
         Write-Log "Authentication failed: $_" -Level Error
@@ -1702,6 +3312,14 @@ function Start-ValidationOnly {
 #endregion
 
 #region Entry Point
+
+# Guard: Don't run entry point if script is being dot-sourced (for testing)
+$isBeingSourced = $MyInvocation.InvocationName -eq '.' -or $MyInvocation.Line -match '^\s*\.\s+'
+if ($isBeingSourced) {
+    Write-Host "Script loaded for testing. Functions available." -ForegroundColor Gray
+    return
+}
+
 if ($Help) {
     Show-Banner
     Show-Help
