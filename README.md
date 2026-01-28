@@ -28,6 +28,61 @@ Interactive wizard for migrating secrets between Secret Server instances using t
 
 ---
 
+## Migration Scope
+
+### What This Tool Migrates
+
+| Object Type | Mode | Notes |
+|-------------|------|-------|
+| **Folders** | Create | Full hierarchy preserved, correct parent/child order |
+| **Secret Policies** | Create | Checkout, expiration, session recording settings |
+| **Secrets** | Create | All fields, custom fields, expiration dates |
+| **RPC/Privileged Account Links** | Create | Two-pass handles dependencies |
+| **Sites** | Map Only | Must exist on target; IDs mapped automatically |
+| **Secret Templates** | Map Only | Must exist on target with matching fields |
+
+### What This Tool Does NOT Migrate
+
+These objects require manual setup on target or Professional Services engagement:
+
+| Object Type | Why Not Included | Recommendation |
+|-------------|------------------|----------------|
+| **Users** | Usually AD-synced | Configure AD sync on target |
+| **Groups** | Usually AD-synced | Configure AD sync on target |
+| **Roles** | Org-specific permissions | Recreate manually or use PS |
+| **Scripts** | Custom RPC scripts | Copy manually or use PS |
+| **Password Types** | RPC password changers | Configure manually or use PS |
+| **Launchers** | Session launch config | Configure manually |
+| **Lists** | Dropdown field options | Configure manually |
+| **Character Sets** | Password char rules | Quick to configure |
+| **Password Requirements** | Complexity rules | Quick to configure |
+| **Reports** | Custom reports | Recreate manually |
+| **Teams** | Org-specific | Recreate manually |
+| **Inbox Templates** | Notification templates | Recreate manually |
+| **Event Pipelines** | Workflow automation | Complex; use PS |
+
+### Post-Migration Manual Steps
+
+After running this tool, you may need to:
+
+1. **RPC Configuration** - If source uses custom Scripts or Password Types, configure these on target first, then update secrets
+2. **Launcher Settings** - Configure any custom launchers used by migrated secrets
+3. **List Values** - If templates use dropdown lists, create those lists on target
+4. **Verify AD Sync** - Ensure users/groups are synced to target before granting access
+
+### When to Use Professional Services
+
+Consider Delinea Professional Services if your migration involves:
+
+- Custom Scripts or Password Types (RPC won't work without them)
+- Event Pipelines or workflow automation
+- Complex role/permission structures
+- Multiple distributed engine sites
+- Compliance requirements (SOX, HIPAA, PCI)
+- 10,000+ secrets
+
+---
+
 ## What's New in v3.0
 
 ### Full Migration Mode

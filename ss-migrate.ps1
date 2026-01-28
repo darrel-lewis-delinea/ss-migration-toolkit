@@ -136,6 +136,11 @@ $script:ErrorCodes = @{
     E4002 = "Duplicate name on target"
     E4003 = "Empty folder skipped"
     E4004 = "RPC config not migrated"
+    E4010 = "Custom scripts detected"
+    E4011 = "Custom password types detected"
+    E4012 = "Lists detected"
+    E4013 = "Custom launchers detected"
+    E4014 = "Event pipelines detected"
 }
 
 function Get-ErrorMessage {
@@ -1360,6 +1365,109 @@ function Test-TemplateMapping {
     return $result
 }
 
+function Test-UnsupportedObjects {
+    <#
+    .SYNOPSIS
+        Check for objects on source that this tool does not migrate
+    .DESCRIPTION
+        Detects Scripts, Password Types, Lists, Launchers, and Event Pipelines
+        and adds warnings to the validation report. These are warnings, not blockers.
+    #>
+    param(
+        [string]$SourceUrl,
+        [string]$SourceToken
+    )
+
+    Write-Log "[$script:CorrelationId] Checking for unsupported objects on source..." -Level Info
+
+    $headers = @{ Authorization = "Bearer $SourceToken" }
+    $warnings = @()
+    $manualWorkItems = @()
+
+    # Check Scripts
+    try {
+        $response = Invoke-RestMethod -Uri "$SourceUrl/api/v1/userscripts" -Headers $headers -Method Get -ErrorAction Stop
+        $scriptCount = if ($response.records) { $response.records.Count } elseif ($response.Count) { $response.Count } else { 0 }
+        if ($scriptCount -gt 0) {
+            $warnings += "[E4010] $scriptCount custom scripts detected - manual migration needed"
+            $manualWorkItems += "Scripts ($scriptCount): Export from Admin > Scripts, recreate on target"
+            Write-Log "[$script:CorrelationId] [E4010] Found $scriptCount scripts on source" -Level Warning
+        }
+    }
+    catch {
+        Write-Log "[$script:CorrelationId] Could not check scripts: $($_.Exception.Message)" -Level Warning
+    }
+
+    # Check Password Types (custom ones beyond defaults)
+    try {
+        $response = Invoke-RestMethod -Uri "$SourceUrl/api/v1/remote-password-changing/password-types" -Headers $headers -Method Get -ErrorAction Stop
+        $pwTypes = if ($response.records) { $response.records } elseif ($response) { $response } else { @() }
+        # Filter to non-default types (default types have lower IDs, typically < 100)
+        $customPwTypes = @($pwTypes | Where-Object { $_.id -gt 100 -or $_.isCustom -eq $true })
+        if ($customPwTypes.Count -gt 0) {
+            $warnings += "[E4011] $($customPwTypes.Count) custom password types detected - RPC may not work"
+            $manualWorkItems += "Password Types ($($customPwTypes.Count)): Configure on target for RPC to work"
+            Write-Log "[$script:CorrelationId] [E4011] Found $($customPwTypes.Count) custom password types" -Level Warning
+        }
+    }
+    catch {
+        Write-Log "[$script:CorrelationId] Could not check password types: $($_.Exception.Message)" -Level Warning
+    }
+
+    # Check Lists
+    try {
+        $response = Invoke-RestMethod -Uri "$SourceUrl/api/v1/lists" -Headers $headers -Method Get -ErrorAction Stop
+        $listCount = if ($response.records) { $response.records.Count } elseif ($response.Count) { $response.Count } else { 0 }
+        if ($listCount -gt 0) {
+            $warnings += "[E4012] $listCount lists detected - template dropdowns may not work"
+            $manualWorkItems += "Lists ($listCount): Create on target before migration"
+            Write-Log "[$script:CorrelationId] [E4012] Found $listCount lists on source" -Level Warning
+        }
+    }
+    catch {
+        Write-Log "[$script:CorrelationId] Could not check lists: $($_.Exception.Message)" -Level Warning
+    }
+
+    # Check Launchers (custom ones)
+    try {
+        $response = Invoke-RestMethod -Uri "$SourceUrl/api/v1/launchers" -Headers $headers -Method Get -ErrorAction Stop
+        $launchers = if ($response.records) { $response.records } elseif ($response) { $response } else { @() }
+        $customLaunchers = @($launchers | Where-Object { $_.isCustom -eq $true -or $_.id -gt 20 })
+        if ($customLaunchers.Count -gt 0) {
+            $warnings += "[E4013] $($customLaunchers.Count) custom launchers detected - manual setup needed"
+            $manualWorkItems += "Launchers ($($customLaunchers.Count)): Configure on target after migration"
+            Write-Log "[$script:CorrelationId] [E4013] Found $($customLaunchers.Count) custom launchers" -Level Warning
+        }
+    }
+    catch {
+        Write-Log "[$script:CorrelationId] Could not check launchers: $($_.Exception.Message)" -Level Warning
+    }
+
+    # Check Event Pipelines
+    try {
+        $response = Invoke-RestMethod -Uri "$SourceUrl/api/v1/event-pipeline-policy/pipelines" -Headers $headers -Method Get -ErrorAction Stop
+        $pipelineCount = if ($response.records) { $response.records.Count } elseif ($response.Count) { $response.Count } else { 0 }
+        if ($pipelineCount -gt 0) {
+            $warnings += "[E4014] $pipelineCount event pipelines detected - consider Professional Services"
+            $manualWorkItems += "Event Pipelines ($pipelineCount): Complex automation - recommend PS engagement"
+            Write-Log "[$script:CorrelationId] [E4014] Found $pipelineCount event pipelines" -Level Warning
+        }
+    }
+    catch {
+        Write-Log "[$script:CorrelationId] Could not check event pipelines: $($_.Exception.Message)" -Level Warning
+    }
+
+    # Add warnings to validation report
+    foreach ($warning in $warnings) {
+        $script:ValidationReport.Warnings += $warning
+    }
+
+    return @{
+        Warnings = $warnings
+        ManualWorkItems = $manualWorkItems
+    }
+}
+
 function Show-ValidationReport {
     <#
     .SYNOPSIS
@@ -1472,8 +1580,26 @@ function Invoke-PreFlightValidation {
         $script:ValidationReport.Blocking += "[E2001] $($siteResult.AffectedSecrets.Count) secrets use unmapped sites"
     }
 
+    # Check for unsupported objects (warnings, not blocking)
+    $unsupportedResult = Test-UnsupportedObjects -SourceUrl $SourceUrl -SourceToken $SourceToken
+
     # Show report
     $canProceed = Show-ValidationReport
+
+    # Show manual work summary if there are unsupported objects
+    if ($unsupportedResult.ManualWorkItems.Count -gt 0) {
+        Write-Host ""
+        Write-Host "┌─────────────────────────────────────────────────────────────┐" -ForegroundColor Yellow
+        Write-Host "│  MANUAL WORK REQUIRED AFTER MIGRATION                       │" -ForegroundColor Yellow
+        Write-Host "├─────────────────────────────────────────────────────────────┤" -ForegroundColor Yellow
+        foreach ($item in $unsupportedResult.ManualWorkItems) {
+            Write-Host "│  • $item" -ForegroundColor White
+        }
+        Write-Host "│                                                             │" -ForegroundColor Yellow
+        Write-Host "│  See TROUBLESHOOTING.md for detailed steps.                 │" -ForegroundColor White
+        Write-Host "└─────────────────────────────────────────────────────────────┘" -ForegroundColor Yellow
+        Write-Host ""
+    }
 
     if (-not $canProceed) {
         Write-Host "Migration cannot proceed until blocking issues are resolved." -ForegroundColor Red

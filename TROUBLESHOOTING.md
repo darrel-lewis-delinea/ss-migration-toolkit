@@ -24,6 +24,11 @@
 | E4002 | WARNING | Duplicate name on target | Handled per DuplicateNamePolicy |
 | E4003 | WARNING | Empty folder skipped | No action needed |
 | E4004 | WARNING | RPC config not migrated | Manual RPC setup required |
+| E4010 | WARNING | Custom scripts detected | Scripts not migrated; manual setup needed |
+| E4011 | WARNING | Custom password types detected | Password types not migrated; RPC may not work |
+| E4012 | WARNING | Lists detected | Lists not migrated; template dropdowns may not work |
+| E4013 | WARNING | Custom launchers detected | Launchers not migrated; configure manually |
+| E4014 | WARNING | Event pipelines detected | Pipelines not migrated; workflow automation needs PS |
 
 ---
 
@@ -377,6 +382,67 @@ When Error **E3006** (Circular RPC reference) is logged, the migration continues
 **After migration:** Manually configure the skipped RPC link in the target Secret Server web UI.
 
 This is rare but can occur when two service accounts authenticate each other (mutual authentication scenarios).
+
+---
+
+## Unsupported Object Warnings (E4010-E4014)
+
+During pre-flight validation, you may see warnings about objects that this tool does not migrate. These are **warnings, not blockers** - the migration will proceed, but you'll need manual work afterward.
+
+### E4010: Custom Scripts Detected
+
+**What it means:** Source has PowerShell/SQL scripts used for RPC password changing.
+
+**Impact:** Secrets using custom password changers won't have working RPC on target.
+
+**Resolution:**
+1. Export scripts manually from source (Admin > Scripts)
+2. Recreate on target before or after migration
+3. Update secrets to use the new script IDs
+
+### E4011: Custom Password Types Detected
+
+**What it means:** Source has custom password type definitions (how to change passwords on specific systems).
+
+**Impact:** RPC won't work for secrets using these password types.
+
+**Resolution:**
+1. Document password types from source (Admin > Remote Password Changing > Password Types)
+2. Recreate on target with same settings
+3. Scripts must exist first (see E4010)
+
+### E4012: Lists Detected
+
+**What it means:** Source has dropdown lists used in secret template fields.
+
+**Impact:** Template fields expecting list values may not work correctly.
+
+**Resolution:**
+1. Export list values from source (Admin > Lists)
+2. Create lists on target before migration
+3. Ensure list names match exactly
+
+### E4013: Custom Launchers Detected
+
+**What it means:** Source has custom session launchers (RDP, SSH, custom apps).
+
+**Impact:** "Launch" button on secrets may not work as expected.
+
+**Resolution:**
+1. Document launcher configurations from source
+2. Recreate on target after migration
+3. Update secret templates to use new launchers
+
+### E4014: Event Pipelines Detected
+
+**What it means:** Source has workflow automation (triggers, actions, notifications).
+
+**Impact:** Automated workflows won't exist on target.
+
+**Resolution:**
+1. This is complex - consider Professional Services
+2. Document pipeline logic manually
+3. Recreate on target after core migration complete
 
 ---
 
