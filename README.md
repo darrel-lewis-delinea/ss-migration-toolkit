@@ -353,9 +353,11 @@ See `TROUBLESHOOTING.md` for common issues:
 |------|-------------|
 | `README.md` | This file - quick start guide |
 | `INSTALL.md` | Prerequisites and installation |
+| `TESTING.md` | Running tests and E2E testing guide |
 | `ARCHITECTURE.md` | Technical design and diagrams |
 | `TROUBLESHOOTING.md` | Common issues and solutions |
 | `REFERENCES.md` | Delinea documentation links |
+| `CLAUDE.md` | Instructions for Claude Code assistance |
 
 ---
 
